@@ -46,6 +46,14 @@ impl<V> Cached<V> {
     }
 }
 
+/// An entry removed while being read (by cleanup or a concurrent refresh) is a miss, not a failure.
+fn unless_vanished<T>(path: &Path, result: Result<Option<T>>) -> Result<Option<T>> {
+    match result {
+        Err(_) if !path.exists() => Ok(None),
+        result => result,
+    }
+}
+
 /// Restarts an entry's lifetime, so content still referenced by other entries is not cleaned up.
 pub(crate) fn renew(marker_path: &Path) -> std::io::Result<()> {
     std::fs::File::options()
@@ -187,15 +195,18 @@ where
             return Ok(None);
         };
 
-        let Some((marker, freshness)) = self.inspect_entry(entry, &path).await? else {
+        let Some((marker, freshness)) =
+            unless_vanished(&path, self.inspect_entry(entry, &path).await)?
+        else {
             trace!("Haven't found marker or entry is past retention for key {entry:?}");
             return Ok(None);
         };
 
-        let result = self
+        let read = self
             .handler
             .read_cache(entry, &self.config, &path, &marker)
-            .await?;
+            .await;
+        let result = unless_vanished(&path, read)?;
 
         if result.is_some() {
             trace!("Cache entry found ({freshness:?}).");
@@ -342,10 +353,11 @@ where
             let path = file.path();
 
             if let Some(key) = self.handler.read_key_from_path(&self.config, &path).await? {
-                let _ = self
+                let inspected = self
                     .inspect_entry(&key, &path)
                     .instrument(Span::none())
-                    .await?;
+                    .await;
+                unless_vanished(&path, inspected)?;
             }
         }
 

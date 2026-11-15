@@ -47,7 +47,7 @@ impl CacheHandler<str, MojangTexture, ModelCacheConfiguration, ()> for MojangTex
 
     fn fresh_for(&self, entry: &str, config: &ModelCacheConfiguration) -> Duration {
         *config.get_cache_duration_with_default(
-            &RenderRequestEntry::TextureHash(entry.to_string()),
+            &RenderRequestEntry::texture_hash(entry.to_string()),
             &config.texture_cache_duration,
         )
     }

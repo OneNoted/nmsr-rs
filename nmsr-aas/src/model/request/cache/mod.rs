@@ -274,6 +274,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn default_skin_hashes_are_recognised_however_they_are_requested() {
+        use crate::model::resolver::default_skins::{DefaultSkin, DefaultSkinResolver};
+
+        let default = DefaultSkinResolver::resolve_default_skin(DefaultSkin::Alex, true);
+
+        assert_eq!(
+            RenderRequestEntry::try_from(default.to_owned()).unwrap(),
+            RenderRequestEntry::DefaultSkinTextureHash(default.to_owned())
+        );
+        assert_eq!(
+            RenderRequestEntry::try_from(ACTIVE.to_owned()).unwrap(),
+            RenderRequestEntry::TextureHash(ACTIVE.to_owned())
+        );
+    }
+
     #[tokio::test]
     async fn textures_linked_from_long_lived_entries_survive_cleanup() {
         let dir = std::env::temp_dir().join(format!("nmsr-cache-test-{}", Uuid::new_v4()));
