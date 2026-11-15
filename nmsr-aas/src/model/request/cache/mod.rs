@@ -107,7 +107,7 @@ impl ModelCache {
         })
     }
 
-    /// Textures are content addressed, so a retained texture is valid whatever its age.
+    /// Textures are content addressed, so a stale texture is still the right texture.
     pub async fn get_cached_texture(&self, texture_id: &str) -> Result<Option<MojangTexture>> {
         Ok(self
             .mojang_textures
@@ -161,5 +161,68 @@ impl ModelCache {
         self.mojang_textures.perform_cache_cleanup().await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::resolver::ResolvedRenderEntryTextureType;
+    use std::{collections::BTreeMap, path::Path, time::SystemTime};
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    const ACTIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const IDLE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn texture(hash: &str) -> MojangTexture {
+        MojangTexture::new_named(hash.to_owned(), b"\x89PNG\r\n\x1a\nfake".to_vec())
+    }
+
+    fn backdate(path: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn textures_still_referenced_by_refreshed_players_survive_cleanup() {
+        let dir = std::env::temp_dir().join(format!("nmsr-cache-test-{}", Uuid::new_v4()));
+        let config = ModelCacheConfiguration {
+            resolve_cache_duration: Duration::ZERO,
+            ..Default::default()
+        };
+        let cache = ModelCache::new(dir.clone(), config).await.unwrap();
+        let player = RenderRequestEntry::MojangPlayerUuid(Uuid::new_v4());
+        let resolved = || {
+            let textures =
+                BTreeMap::from([(ResolvedRenderEntryTextureType::Skin, texture(ACTIVE))]);
+            ResolvedRenderEntryTextures::new(textures, None)
+        };
+
+        cache
+            .cache_resolved_texture(&player, &resolved())
+            .await
+            .unwrap();
+        cache.cache_texture(&texture(IDLE)).await.unwrap();
+        backdate(&dir.join("textures").join(ACTIVE), 5 * DAY);
+        backdate(&dir.join("textures").join(IDLE), 5 * DAY);
+
+        cache
+            .cache_resolved_texture(&player, &resolved())
+            .await
+            .unwrap();
+        cache.do_cache_clean_up().await.unwrap();
+
+        let player_skin = cache.get_cached_resolved_texture(&player).await.unwrap();
+        assert!(player_skin.is_some_and(|cached| cached
+            .value
+            .textures
+            .contains_key(&ResolvedRenderEntryTextureType::Skin)));
+        assert!(cache.get_cached_texture(IDLE).await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

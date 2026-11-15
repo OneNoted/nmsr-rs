@@ -46,6 +46,14 @@ impl<V> Cached<V> {
     }
 }
 
+/// Restarts an entry's lifetime, so content still referenced by other entries is not cleaned up.
+fn renew(marker_path: &Path) -> std::io::Result<()> {
+    std::fs::File::options()
+        .write(true)
+        .open(marker_path)?
+        .set_modified(SystemTime::now())
+}
+
 /// Classifies an entry of the given age; `None` means it is past retention and should be deleted.
 /// A `fresh_for` of [`Duration::MAX`] never expires.
 fn freshness_at(
@@ -139,7 +147,7 @@ where
         marker: &Path,
     ) -> Result<()>;
 
-    /// Whether the key identifies the value's content, so an existing entry never needs replacing.
+    /// Whether the key identifies the value's content, so an existing entry is renewed instead of replaced.
     fn is_content_addressed(&self) -> bool {
         false
     }
@@ -202,12 +210,7 @@ where
             return Ok(None);
         }
 
-        let marker_path = self.handler.get_marker_path(entry, &self.config).await?;
-        let marker_path = if marker_path.is_empty() {
-            path.to_owned()
-        } else {
-            path.join(marker_path)
-        };
+        let marker_path = self.marker_path(entry, path).await?;
 
         if !marker_path.exists() {
             trace!("Cache entry path {} doesn't exist.", marker_path.display());
@@ -244,6 +247,16 @@ where
         Ok(freshness.map(|freshness| (marker, freshness)))
     }
 
+    async fn marker_path(&self, entry: &Key, path: &Path) -> Result<PathBuf> {
+        let marker_path = self.handler.get_marker_path(entry, &self.config).await?;
+
+        Ok(if marker_path.is_empty() {
+            path.to_owned()
+        } else {
+            path.join(marker_path)
+        })
+    }
+
     #[inline]
     pub(crate) async fn invalidate_self<'a>(entry: &'a Key, path: &'a Path) -> Result<()> {
         trace!(
@@ -272,28 +285,21 @@ where
         let path = self.get_cache_entry_path(entry).await?;
 
         if let Some(path) = &path {
-            if path.exists() {
-                let keep_existing = self.handler.is_content_addressed()
-                    || matches!(
-                        self.inspect_entry(entry, path).await?,
-                        Some((_, Freshness::Fresh))
-                    );
+            let marker_path = self.marker_path(entry, path).await?;
 
-                if keep_existing {
+            if path.exists() {
+                if self.handler.is_content_addressed() {
+                    renew(&marker_path)
+                        .explain(format!("Unable to renew cache entry {entry:?}"))?;
                     return Ok(Some(path.clone()));
                 }
 
-                if path.exists() {
-                    Self::invalidate_self(entry, path).await?;
+                if let Some((_, Freshness::Fresh)) = self.inspect_entry(entry, path).await? {
+                    return Ok(Some(path.clone()));
                 }
-            }
 
-            let marker_path = self.handler.get_marker_path(entry, &self.config).await?;
-            let marker_path = if marker_path.is_empty() {
-                path.to_owned()
-            } else {
-                path.join(marker_path)
-            };
+                Self::invalidate_self(entry, path).await?;
+            }
 
             self.handler
                 .write_cache(entry, value, &self.config, path)
