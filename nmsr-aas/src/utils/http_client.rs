@@ -88,7 +88,7 @@ pub struct NmsrHttpClient {
 /// Wait used when an upstream answers 429 without a usable `Retry-After`.
 const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
 /// Upper bound so a hostile or buggy `Retry-After` cannot disable a host for long.
-const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_mins(5);
 
 /// Per-host deadlines before which requests are refused locally instead of sent,
 /// so a rate-limited upstream is not asked again until it said it would answer.
@@ -114,9 +114,12 @@ impl UpstreamBackoff {
 
     fn defer(&self, host: &str, wait: Duration) {
         let deadline = Instant::now() + wait;
-        let mut deadlines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = deadlines.entry(host.to_owned()).or_insert(deadline);
-        *entry = (*entry).max(deadline);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(host.to_owned())
+            .and_modify(|current| *current = (*current).max(deadline))
+            .or_insert(deadline);
     }
 }
 

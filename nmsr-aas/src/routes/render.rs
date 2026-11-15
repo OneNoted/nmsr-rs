@@ -40,11 +40,11 @@ const NMSR_FALLBACK_REASON_HEADER: HeaderName = HeaderName::from_static("x-nmsr-
 const NMSR_STALE_HEADER: HeaderName = HeaderName::from_static("x-nmsr-stale");
 const TRUE_VALUE: HeaderValue = HeaderValue::from_static("True");
 
-const ONE_YEAR: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+const ONE_YEAR: Duration = Duration::from_hours(24 * 365);
 /// A default skin for a nonexistent player may become wrong as soon as the name is registered.
-const PLAYER_NOT_FOUND_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+const PLAYER_NOT_FOUND_MAX_AGE: Duration = Duration::from_mins(5);
 /// A last known good skin is shown while Mojang is unavailable and should be replaced soon after it recovers.
-const LAST_KNOWN_GOOD_MAX_AGE: Duration = Duration::from_secs(60);
+const LAST_KNOWN_GOOD_MAX_AGE: Duration = Duration::from_mins(1);
 
 #[axum::debug_handler]
 #[instrument(skip(state, method))]
@@ -146,13 +146,13 @@ mod tests {
     fn player() -> RenderRequest {
         request(
             RenderRequestMode::HeadIso,
-            RenderRequestEntry::MojangPlayerName("MrHmar".into()),
+            RenderRequestEntry::MojangPlayerName("Alice".into()),
         )
     }
 
     fn config() -> ModelCacheConfiguration {
         ModelCacheConfiguration {
-            resolve_cache_duration: Duration::from_secs(900),
+            resolve_cache_duration: Duration::from_mins(15),
             ..Default::default()
         }
     }

@@ -148,8 +148,6 @@ pub enum MojangRequestError {
     BoxedRequestError(BoxError),
     #[error("Request error: {0}")]
     RequestError(#[from] hyper_util::client::legacy::Error),
-    #[error("Missing skin from game profile: {0}")]
-    MissingSkinPropertyError(Uuid),
     #[error("Received invalid texture url: {0}")]
     InvalidTextureUrlError(String),
     #[error("Received result while fetching from mojang: {0}")]
@@ -200,7 +198,6 @@ impl MojangRequestError {
             Self::GameProfileNotFound(_)
             | Self::NamedGameProfileNotFound(_)
             | Self::InvalidTextureHashError(_)
-            | Self::MissingSkinPropertyError(_)
             | Self::UnableToParseUuidIntoXuid(_) => FailureKind::NotFound,
             Self::UpstreamRateLimited { retry_after, .. } => FailureKind::Unavailable {
                 retry_after: Some(*retry_after),

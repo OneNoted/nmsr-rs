@@ -170,7 +170,7 @@ mod tests {
     use crate::model::resolver::ResolvedRenderEntryTextureType;
     use std::{collections::BTreeMap, path::Path, time::SystemTime};
 
-    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    const DAY: Duration = Duration::from_hours(24);
     const ACTIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const IDLE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 

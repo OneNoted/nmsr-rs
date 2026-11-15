@@ -423,22 +423,36 @@ impl RenderRequestResolver {
 
                 let textures = result.textures()?;
 
-                let skin = textures
-                    .skin()
-                    .ok_or_else(|| MojangRequestError::MissingSkinPropertyError(*id))?;
-                let cape = textures.cape();
-
-                model = if skin.is_slim() {
-                    Some(RenderRequestEntryModel::Alex)
+                if let Some(skin) = textures.skin() {
+                    model = Some(if skin.is_slim() {
+                        RenderRequestEntryModel::Alex
+                    } else {
+                        RenderRequestEntryModel::Steve
+                    });
+                    skin_texture = self
+                        .fetch_game_profile_texture(Some(skin), MojangTextureRequestType::Skin)
+                        .await?;
                 } else {
-                    Some(RenderRequestEntryModel::Steve)
-                };
+                    // Players who never chose a skin have none in their profile; Mojang shows the default for their UUID.
+                    let (default_skin, slim) =
+                        DefaultSkinResolver::resolve_default_skin_for_uuid_parts(*id, None);
+                    model = Some(if slim {
+                        RenderRequestEntryModel::Alex
+                    } else {
+                        RenderRequestEntryModel::Steve
+                    });
+                    skin_texture = Some(
+                        self.fetch_texture_from_mojang(
+                            DefaultSkinResolver::resolve_default_skin(default_skin, slim),
+                            None,
+                            MojangTextureRequestType::DefaultSkin,
+                        )
+                        .await?,
+                    );
+                }
 
-                skin_texture = self
-                    .fetch_game_profile_texture(textures.skin(), MojangTextureRequestType::Skin)
-                    .await?;
                 cape_texture = self
-                    .fetch_game_profile_texture(cape, MojangTextureRequestType::Cape)
+                    .fetch_game_profile_texture(textures.cape(), MojangTextureRequestType::Cape)
                     .await?;
             }
             RenderRequestEntry::GeyserPlayerUuid(id) => {

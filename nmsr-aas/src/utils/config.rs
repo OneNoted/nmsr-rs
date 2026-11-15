@@ -52,6 +52,9 @@ pub struct ModelCacheConfiguration {
     /// How long an expired name or player resolution stays on disk after its lifetime ends.
     /// Such a stale entry is only served while Mojang cannot answer (rate limited, erroring or
     /// unreachable), so a known player keeps their skin instead of falling back to a default one.
+    /// Textures are kept for the same extra time after their last use, so that a stale player
+    /// entry still has its skin: a texture is deleted `texture_cache_duration` plus this duration
+    /// after the last resolution that referenced it.
     #[serde(with = "humantime_serde")]
     pub stale_if_error_duration: Duration,
 
@@ -69,7 +72,7 @@ impl Default for ModelCacheConfiguration {
             username_cache_duration: Duration::from_secs(60 * 60),
             resolve_cache_duration: Duration::from_secs(60 * 60 * 15),
             texture_cache_duration: Duration::from_secs(60 * 60 * 24 * 2),
-            stale_if_error_duration: Duration::from_secs(60 * 60 * 24 * 2),
+            stale_if_error_duration: Duration::from_hours(48),
             cache_biases: HashMap::new(),
         }
     }

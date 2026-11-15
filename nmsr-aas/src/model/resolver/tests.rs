@@ -31,6 +31,7 @@ enum Upstream {
     Healthy,
     RateLimited { retry_after_secs: u64 },
     Missing,
+    Skinless,
 }
 
 struct Fake {
@@ -61,7 +62,9 @@ async fn name_lookup(State(fake): State<Arc<Fake>>, Path(_): Path<String>) -> Re
     fake.name_lookups.fetch_add(1, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(20)).await;
     match fake.mode() {
-        Upstream::Healthy => Json(json!({ "id": ID, "name": NAME })).into_response(),
+        Upstream::Healthy | Upstream::Skinless => {
+            Json(json!({ "id": ID, "name": NAME })).into_response()
+        }
         Upstream::RateLimited { retry_after_secs } => rate_limited(retry_after_secs),
         Upstream::Missing => StatusCode::NOT_FOUND.into_response(),
     }
@@ -69,23 +72,23 @@ async fn name_lookup(State(fake): State<Arc<Fake>>, Path(_): Path<String>) -> Re
 
 async fn session_profile(State(fake): State<Arc<Fake>>, Path(_): Path<String>) -> Response {
     tokio::time::sleep(Duration::from_millis(20)).await;
-    match fake.mode() {
+    let skins = match fake.mode() {
         Upstream::Healthy => {
             let base = fake.base.lock().unwrap().clone();
-            let textures = json!({
-                "textures": { "SKIN": { "url": format!("{base}/texture/{SKIN_HASH}") } }
-            });
-            let value = STANDARD.encode(textures.to_string());
-            Json(json!({
-                "id": ID,
-                "name": NAME,
-                "properties": [{ "name": "textures", "value": value }],
-            }))
-            .into_response()
+            json!({ "SKIN": { "url": format!("{base}/texture/{SKIN_HASH}") } })
         }
-        Upstream::RateLimited { retry_after_secs } => rate_limited(retry_after_secs),
-        Upstream::Missing => StatusCode::NO_CONTENT.into_response(),
-    }
+        Upstream::Skinless => json!({}),
+        Upstream::RateLimited { retry_after_secs } => return rate_limited(retry_after_secs),
+        Upstream::Missing => return StatusCode::NO_CONTENT.into_response(),
+    };
+    let value = STANDARD.encode(json!({ "textures": skins }).to_string());
+
+    Json(json!({
+        "id": ID,
+        "name": NAME,
+        "properties": [{ "name": "textures", "value": value }],
+    }))
+    .into_response()
 }
 
 async fn texture(Path(hash): Path<String>) -> Response {
@@ -228,6 +231,22 @@ async fn known_player_keeps_their_skin_while_rate_limited_and_recovers() {
     assert_eq!(
         resolve(&h, &by_name()).await,
         (TextureSource::Current, CUSTOM_SKIN)
+    );
+}
+
+#[tokio::test]
+async fn player_without_a_skin_gets_their_own_default_as_a_current_render() {
+    let h = harness().await;
+    h.fake.set(Upstream::Skinless);
+
+    let by_name = h.resolver.resolve(&by_name()).await.unwrap();
+    let by_uuid = h.resolver.resolve(&by_uuid()).await.unwrap();
+
+    assert_eq!(by_name.source, TextureSource::Current);
+    assert_eq!(by_name.model, by_uuid.model);
+    assert_eq!(
+        by_name.textures[&ResolvedRenderEntryTextureType::Skin],
+        by_uuid.textures[&ResolvedRenderEntryTextureType::Skin]
     );
 }
 
