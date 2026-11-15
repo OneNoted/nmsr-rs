@@ -19,6 +19,7 @@ use tower::{
     balance::p2c::Balance,
     buffer::Buffer,
     discover::ServiceList,
+    layer::util::{Identity, Stack},
     limit::RateLimit,
     load::{CompleteOnResponse, PeakEwmaDiscover},
     retry::{Policy, Retry},
@@ -59,7 +60,7 @@ pub(crate) type NmsrTraceLayer = Trace<
 
 pub(crate) type HttpClientInnerService = Buffer<
     Request<SyncBody>,
-    <RateLimit<BackoffGate<Retry<MojankRetryPolicy, Timeout<NmsrTraceLayer>>>> as Service<
+    <RateLimit<Retry<MojankRetryPolicy, BackoffGate<Timeout<NmsrTraceLayer>>>> as Service<
         Request<SyncBody>,
     >>::Future,
 >;
@@ -342,10 +343,7 @@ fn create_http_client_internal(
     let service = ServiceBuilder::new()
         .buffer(rate_limit_per_second.saturating_mul(2) as usize)
         .rate_limit(rate_limit_per_second, Duration::from_secs(1))
-        .layer(BackoffGateLayer(backoff.clone()))
-        .layer(CloneRetryLayer::new(MojankRetryPolicy::new(
-            request_retries_count, /* Retry attempts */
-        )))
+        .layer(attempt_layers(request_retries_count, backoff).into_inner())
         .layer(TimeoutLayer::new(Duration::from_secs(
             request_timeout_seconds,
         )))
@@ -373,16 +371,18 @@ impl MojankRetryPolicy {
     }
 }
 
-impl<P, Res> Policy<Request<SyncBody>, Res, P> for MojankRetryPolicy {
+impl<Res> Policy<Request<SyncBody>, Res, BoxError> for MojankRetryPolicy {
     type Future = Ready<()>;
 
     fn retry(
         &mut self,
         _req: &mut Request<SyncBody>,
-        result: &mut Result<Res, P>,
+        result: &mut Result<Res, BoxError>,
     ) -> Option<Self::Future> {
         match result {
             Ok(_) => None,
+            // Refused locally by the backoff gate; retrying now would only be refused again.
+            Err(error) if error.is::<MojangRequestError>() => None,
             Err(_) => {
                 if self.attempts > 0 {
                     self.attempts -= 1;
@@ -437,8 +437,18 @@ where
     }
 }
 
-/// Re-checks the backoff once a queued request has passed the rate limiter, so requests that were
-/// already waiting when an upstream answered 429 are not sent before its `Retry-After`.
+/// Retries wrap the backoff gate, so every attempt is checked against the backoff.
+fn attempt_layers(
+    retries: usize,
+    backoff: &Arc<UpstreamBackoff>,
+) -> ServiceBuilder<Stack<BackoffGateLayer, Stack<CloneRetryLayer<MojankRetryPolicy>, Identity>>> {
+    ServiceBuilder::new()
+        .layer(CloneRetryLayer::new(MojankRetryPolicy::new(retries)))
+        .layer(BackoffGateLayer(backoff.clone()))
+}
+
+/// Checks the backoff on every attempt that has passed the rate limiter, retries included, so requests
+/// that were already queued or in flight when an upstream answered 429 are not sent before its `Retry-After`.
 #[derive(Clone)]
 pub struct BackoffGateLayer(Arc<UpstreamBackoff>);
 
@@ -633,6 +643,36 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_are_not_sent_to_a_host_that_backed_off_meanwhile() {
+        let backoff = Arc::new(UpstreamBackoff::default());
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counter, concurrent_429) = (sent.clone(), backoff.clone());
+        let mut service =
+            attempt_layers(3, &backoff).service(tower::service_fn(move |_: Request<SyncBody>| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                concurrent_429.defer("api.mojang.com", Duration::from_secs(60));
+                ready(Err::<(), BoxError>("connection reset".into()))
+            }));
+        let request = Request::get("https://api.mojang.com/users/profiles/minecraft/Alice")
+            .body(SyncBody::new(Empty::new().map_err(|e| match e {})))
+            .unwrap();
+
+        let error = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<MojangRequestError>(),
+            Some(MojangRequestError::UpstreamRateLimited { .. })
+        ));
         assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

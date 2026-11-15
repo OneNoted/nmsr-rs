@@ -91,11 +91,20 @@ async fn session_profile(State(fake): State<Arc<Fake>>, Path(_): Path<String>) -
     .into_response()
 }
 
+/// Pixel (0, 0) tells custom from default skins; pixel (1, 0) identifies which texture was served.
+fn texture_png(hash: &str) -> Vec<u8> {
+    let shade = if hash == SKIN_HASH {
+        CUSTOM_SKIN
+    } else {
+        DEFAULT_SKIN
+    };
+    let mut pixels = vec![shade; 64 * 64 * 4];
+    pixels[4] = u8::from_str_radix(&hash[..2], 16).unwrap();
+    create_png_from_bytes((64, 64), &pixels).unwrap()
+}
+
 async fn texture(Path(hash): Path<String>) -> Response {
-    let shade = if hash == SKIN_HASH { 200 } else { 50 };
-    create_png_from_bytes((64, 64), &[shade; 64 * 64 * 4])
-        .unwrap()
-        .into_response()
+    texture_png(&hash).into_response()
 }
 
 struct Harness {
@@ -242,12 +251,24 @@ async fn player_without_a_skin_gets_their_own_default_as_a_current_render() {
     let by_name = h.resolver.resolve(&by_name()).await.unwrap();
     let by_uuid = h.resolver.resolve(&by_uuid()).await.unwrap();
 
-    assert_eq!(by_name.source, TextureSource::Current);
-    assert_eq!(by_name.model, by_uuid.model);
-    assert_eq!(
-        by_name.textures[&ResolvedRenderEntryTextureType::Skin],
-        by_uuid.textures[&ResolvedRenderEntryTextureType::Skin]
-    );
+    let uuid = Uuid::parse_str(ID).unwrap();
+    let own_default = texture_png(DefaultSkinResolver::resolve_default_skin_for_uuid(
+        uuid, None,
+    ));
+    let own_model = if DefaultSkinResolver::is_default_skin_for_uuid_slim(uuid) {
+        RenderRequestEntryModel::Alex
+    } else {
+        RenderRequestEntryModel::Steve
+    };
+
+    for resolved in [by_name, by_uuid] {
+        assert_eq!(resolved.source, TextureSource::Current);
+        assert_eq!(resolved.model, own_model);
+        assert_eq!(
+            resolved.textures[&ResolvedRenderEntryTextureType::Skin],
+            own_default
+        );
+    }
 }
 
 #[tokio::test]

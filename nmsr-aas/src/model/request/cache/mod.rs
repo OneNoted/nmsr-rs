@@ -18,8 +18,9 @@ pub(crate) mod names;
 pub(crate) mod textures;
 
 use crate::{
-    caching::{CacheSystem, Cached},
+    caching::{renew, CacheSystem, Cached},
     config::ModelCacheConfiguration,
+    error::ExplainableExt,
     model::resolver::{MojangTexture, ResolvedRenderEntryTextures},
 };
 
@@ -166,9 +167,43 @@ impl ModelCache {
 
     pub(crate) async fn do_cache_clean_up(&self) -> Result<()> {
         self.resolved_textures.perform_cache_cleanup().await?;
+        self.renew_linked_textures().await?;
         self.mojang_textures.perform_cache_cleanup().await?;
 
         Ok(())
+    }
+
+    /// Resolved entries link to their textures, and may outlive the texture lifetime (cache biases, default
+    /// skins). Renewing every linked texture before cleanup keeps it while any entry still uses it.
+    async fn renew_linked_textures(&self) -> Result<()> {
+        let resolved = self.resolved_textures.base_path().to_owned();
+
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for entry in std::fs::read_dir(&resolved)? {
+                let entry = entry?.path();
+                if !entry.is_dir() {
+                    continue;
+                }
+
+                for file in std::fs::read_dir(&entry)? {
+                    let file = file?.path();
+                    if !file.symlink_metadata()?.is_symlink() {
+                        continue;
+                    }
+
+                    match renew(&file) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        renewed => renewed?,
+                    }
+                }
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|renewed| renewed)
+        .explain("Unable to renew textures linked from resolved entries".to_owned())
     }
 }
 
@@ -193,6 +228,37 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - age)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn textures_linked_from_long_lived_entries_survive_cleanup() {
+        let dir = std::env::temp_dir().join(format!("nmsr-cache-test-{}", Uuid::new_v4()));
+        let player = RenderRequestEntry::MojangPlayerUuid(Uuid::new_v4());
+        let mut config = ModelCacheConfiguration::default();
+        config
+            .cache_biases
+            .insert(player.clone(), CacheBias::CacheIndefinitely);
+        let cache = ModelCache::new(dir.clone(), config).await.unwrap();
+        let textures = BTreeMap::from([(ResolvedRenderEntryTextureType::Skin, texture(ACTIVE))]);
+
+        cache
+            .cache_resolved_texture(&player, &ResolvedRenderEntryTextures::new(textures, None))
+            .await
+            .unwrap();
+        cache.cache_texture(&texture(IDLE)).await.unwrap();
+        backdate(&dir.join("textures").join(ACTIVE), 5 * DAY);
+        backdate(&dir.join("textures").join(IDLE), 5 * DAY);
+
+        cache.do_cache_clean_up().await.unwrap();
+
+        let player_skin = cache.get_cached_resolved_texture(&player).await.unwrap();
+        assert!(player_skin.is_some_and(|cached| cached
+            .value
+            .textures
+            .contains_key(&ResolvedRenderEntryTextureType::Skin)));
+        assert!(cache.get_cached_texture(IDLE).await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

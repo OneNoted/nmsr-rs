@@ -47,7 +47,7 @@ impl<V> Cached<V> {
 }
 
 /// Restarts an entry's lifetime, so content still referenced by other entries is not cleaned up.
-fn renew(marker_path: &Path) -> std::io::Result<()> {
+pub(crate) fn renew(marker_path: &Path) -> std::io::Result<()> {
     std::fs::File::options()
         .write(true)
         .open(marker_path)?
@@ -170,6 +170,10 @@ where
             handler,
             _phantom: PhantomData,
         })
+    }
+
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
     }
 
     pub async fn get_cache_entry_path(&self, entry: &Key) -> Result<Option<PathBuf>> {
