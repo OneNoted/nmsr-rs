@@ -184,16 +184,17 @@ impl ModelCache {
                 if !entry.is_dir() {
                     continue;
                 }
+                let Some(files) = unless_vanished(std::fs::read_dir(&entry))? else {
+                    continue;
+                };
 
-                for file in std::fs::read_dir(&entry)? {
+                for file in files {
                     let file = file?.path();
-                    if !file.symlink_metadata()?.is_symlink() {
-                        continue;
-                    }
+                    let linked = unless_vanished(file.symlink_metadata())?
+                        .is_some_and(|metadata| metadata.is_symlink());
 
-                    match renew(&file) {
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        renewed => renewed?,
+                    if linked {
+                        unless_vanished(renew(&file))?;
                     }
                 }
             }
@@ -204,6 +205,14 @@ impl ModelCache {
         .map_err(std::io::Error::other)
         .and_then(|renewed| renewed)
         .explain("Unable to renew textures linked from resolved entries".to_owned())
+    }
+}
+
+/// Entries are replaced concurrently by refreshes, so anything may vanish mid-scan.
+fn unless_vanished<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        result => result.map(Some),
     }
 }
 
@@ -228,6 +237,41 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - age)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_skins_stay_cached_through_cleanup() {
+        use crate::model::resolver::default_skins::{DefaultSkin, DefaultSkinResolver};
+
+        let dir = std::env::temp_dir().join(format!("nmsr-cache-test-{}", Uuid::new_v4()));
+        let hash = DefaultSkinResolver::resolve_default_skin(DefaultSkin::Steve, false);
+        let default_skin = RenderRequestEntry::DefaultSkinTextureHash(hash.to_owned());
+        let mut config = ModelCacheConfiguration::default();
+        config
+            .cache_biases
+            .insert(default_skin.clone(), CacheBias::CacheIndefinitely);
+        let cache = ModelCache::new(dir.clone(), config).await.unwrap();
+        let textures = BTreeMap::from([(ResolvedRenderEntryTextureType::Skin, texture(hash))]);
+
+        cache
+            .cache_resolved_texture(
+                &default_skin,
+                &ResolvedRenderEntryTextures::new(textures, None),
+            )
+            .await
+            .unwrap();
+        backdate(&dir.join("resolved").join(hash).join("marker"), 5 * DAY);
+        backdate(&dir.join("textures").join(hash), 5 * DAY);
+
+        cache.do_cache_clean_up().await.unwrap();
+
+        assert!(cache
+            .get_cached_resolved_texture(&default_skin)
+            .await
+            .unwrap()
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

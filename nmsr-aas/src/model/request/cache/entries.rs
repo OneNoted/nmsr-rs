@@ -10,7 +10,10 @@ use crate::{
     error::{ExplainableExt, ModelCacheError, Result},
     model::{
         request::{cache::textures::MojangTextureCacheHandler, entry::RenderRequestEntry},
-        resolver::{MojangTexture, ResolvedRenderEntryTextureType, ResolvedRenderEntryTextures},
+        resolver::{
+            default_skins::DefaultSkinResolver, MojangTexture, ResolvedRenderEntryTextureType,
+            ResolvedRenderEntryTextures,
+        },
     },
 };
 
@@ -54,9 +57,18 @@ impl CacheHandler<RenderRequestEntry, ResolvedRenderEntryTextures, ModelCacheCon
             .unwrap_or_default()
             .to_string();
 
+        // Directory names do not record whether a hash is a default skin, which decides its cache bias.
         Ok(RenderRequestEntry::try_from(file_name)
-            .map(|e| Cow::Owned(e))
-            .ok())
+            .ok()
+            .map(|entry| match entry {
+                RenderRequestEntry::TextureHash(hash)
+                    if DefaultSkinResolver::is_default_skin_hash(&hash) =>
+                {
+                    RenderRequestEntry::DefaultSkinTextureHash(hash)
+                }
+                entry => entry,
+            })
+            .map(Cow::Owned))
     }
 
     fn fresh_for(&self, entry: &RenderRequestEntry, config: &ModelCacheConfiguration) -> Duration {

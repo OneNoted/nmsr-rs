@@ -1,5 +1,5 @@
 use serde::Serialize;
-use strum::{EnumCount, EnumIter, FromRepr};
+use strum::{EnumCount, EnumIter, FromRepr, IntoEnumIterator};
 use uuid::Uuid;
 
 #[derive(
@@ -45,6 +45,15 @@ impl DefaultSkinResolver {
         let (default_skin, is_slim) = Self::resolve_default_skin_for_uuid_parts(uuid, slim);
 
         Self::resolve_default_skin(default_skin, is_slim)
+    }
+
+    #[must_use]
+    pub fn is_default_skin_hash(hash: &str) -> bool {
+        DefaultSkin::iter().any(|skin| {
+            [false, true]
+                .into_iter()
+                .any(|slim| Self::resolve_default_skin(skin, slim) == hash)
+        })
     }
 
     pub fn resolve_default_skin(skin_name: DefaultSkin, is_slim: bool) -> &'static str {

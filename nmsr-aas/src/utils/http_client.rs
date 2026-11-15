@@ -676,6 +676,24 @@ mod tests {
         assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn local_backoff_refusals_are_not_retried_but_transport_errors_are() {
+        let mut policy = MojankRetryPolicy::new(3);
+        let mut request = Request::get("https://api.mojang.com/")
+            .body(SyncBody::new(Empty::new().map_err(|e| match e {})))
+            .unwrap();
+        let refused = MojangRequestError::UpstreamRateLimited {
+            host: "api.mojang.com".to_owned(),
+            retry_after: Duration::from_secs(60),
+        };
+
+        let mut refusal: Result<(), BoxError> = Err(Box::new(refused));
+        assert!(policy.retry(&mut request, &mut refusal).is_none());
+
+        let mut reset: Result<(), BoxError> = Err("connection reset".into());
+        assert!(policy.retry(&mut request, &mut reset).is_some());
+    }
+
     #[tokio::test]
     async fn a_response_body_that_stalls_times_out() {
         let app = axum::Router::new().route(
