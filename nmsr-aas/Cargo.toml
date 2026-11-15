@@ -123,7 +123,7 @@ serde_with = { workspace = true }
 deadpool = { workspace = true }
 image = { workspace = true, default-features = false }
 
-chrono = { workspace = true }
+httpdate = { workspace = true }
 tokio-stream = { workspace = true, features = ["fs"] }
 sync_wrapper = { workspace = true }
 

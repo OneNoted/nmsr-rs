@@ -1,9 +1,7 @@
-use std::{borrow::Cow, fs::Metadata, path::Path, time::SystemTime};
+use std::{borrow::Cow, path::Path, time::Duration};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Local};
 use tokio::fs;
-use tracing::trace;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -33,24 +31,12 @@ impl CacheHandler<str, Uuid, ModelCacheConfiguration, ()> for MojangNamesCacheHa
         return Ok(Some(format!("usr_{}", xxh3_64(entry.as_bytes()))));
     }
 
-    fn is_expired(
-        &self,
-        entry: &str,
-        config: &ModelCacheConfiguration,
-        _marker: &(),
-        marker_metadata: Metadata,
-    ) -> Result<bool> {
-        let expiry = marker_metadata.modified().explain(format!(
-            "Unable to get marker modified date for entry {:?}",
-            &entry
-        ))? + config.username_cache_duration;
+    fn fresh_for(&self, _entry: &str, config: &ModelCacheConfiguration) -> Duration {
+        config.username_cache_duration
+    }
 
-        trace!(
-            "Name cache entry expires on {}",
-            Into::<DateTime<Local>>::into(expiry)
-        );
-
-        Ok(expiry < SystemTime::now())
+    fn retain_stale_for(&self, config: &ModelCacheConfiguration) -> Duration {
+        config.stale_if_error_duration
     }
 
     async fn write_cache(
@@ -115,9 +101,5 @@ impl CacheHandler<str, Uuid, ModelCacheConfiguration, ()> for MojangNamesCacheHa
         _marker: &Path,
     ) -> Result<()> {
         Ok(())
-    }
-
-    fn always_overwrite(&self) -> bool {
-        false
     }
 }

@@ -1,23 +1,13 @@
-use std::{
-    collections::HashMap,
-    fs::Metadata,
-    net::IpAddr,
-    path::PathBuf,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, net::IpAddr, path::PathBuf, time::Duration};
 
-use chrono::{DateTime, Local};
 use derive_more::Debug;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr, TryFromInto};
 use tracing::trace;
 use twelf::config;
 
-use crate::{
-    error::ExplainableExt,
-    model::request::{
-        cache::CacheBias, entry::RenderRequestEntry, RenderRequestFeatures, RenderRequestMode,
-    },
+use crate::model::request::{
+    cache::CacheBias, entry::RenderRequestEntry, RenderRequestFeatures, RenderRequestMode,
 };
 
 #[config]
@@ -59,6 +49,12 @@ pub struct ModelCacheConfiguration {
     #[serde(with = "humantime_serde")]
     pub texture_cache_duration: Duration,
 
+    /// How long an expired name or player resolution stays on disk after its lifetime ends.
+    /// Such a stale entry is only served while Mojang cannot answer (rate limited, erroring or
+    /// unreachable), so a known player keeps their skin instead of falling back to a default one.
+    #[serde(with = "humantime_serde")]
+    pub stale_if_error_duration: Duration,
+
     /// Cache biases for specific entries.
     /// A cache bias is a duration of time to keep a specific entry in the cache.
     /// This is useful for entries that are requested often, such as the models in the home page.
@@ -73,6 +69,7 @@ impl Default for ModelCacheConfiguration {
             username_cache_duration: Duration::from_secs(60 * 60),
             resolve_cache_duration: Duration::from_secs(60 * 60 * 15),
             texture_cache_duration: Duration::from_secs(60 * 60 * 24 * 2),
+            stale_if_error_duration: Duration::from_secs(60 * 60 * 24 * 2),
             cache_biases: HashMap::new(),
         }
     }
@@ -244,37 +241,6 @@ impl ModelCacheConfiguration {
                 CacheBias::CacheIndefinitely => &Duration::MAX,
             }
         })
-    }
-
-    pub fn is_expired(
-        &self,
-        entry: &RenderRequestEntry,
-        marker_metadata: &Metadata,
-    ) -> crate::error::Result<bool> {
-        self.is_expired_with_default(entry, marker_metadata, &self.resolve_cache_duration)
-    }
-
-    pub fn is_expired_with_default(
-        &self,
-        entry: &RenderRequestEntry,
-        marker_metadata: &Metadata,
-        default_duration: &Duration,
-    ) -> crate::error::Result<bool> {
-        let duration = self.get_cache_duration_with_default(entry, default_duration);
-
-        // Short-circuit never expiring entry.
-        if duration == &Duration::MAX {
-            return Ok(false);
-        }
-
-        let expiry = marker_metadata.modified().explain(format!(
-            "Unable to get marker modified date for entry {:?}",
-            &entry
-        ))? + *duration;
-
-        trace!("Entry expires on {}", Into::<DateTime<Local>>::into(expiry));
-
-        Ok(expiry < SystemTime::now())
     }
 
     const VALID_PNG_HEADER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];

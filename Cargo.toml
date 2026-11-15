@@ -95,7 +95,7 @@ http = { version = "1.4" }
 
 enumset = { version = "1.1" }
 
-chrono = { version = "0.4" }
+httpdate = { version = "1.0" }
 tokio-stream = { version = "0.1", features = ["fs"] }
 sync_wrapper = { version = "1.0" }
 

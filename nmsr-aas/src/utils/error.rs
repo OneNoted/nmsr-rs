@@ -1,7 +1,10 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use axum::response::IntoResponse;
-use http::{HeaderName, HeaderValue};
+use http::{
+    header::{CACHE_CONTROL, RETRY_AFTER},
+    HeaderName, HeaderValue,
+};
 use hyper::StatusCode;
 use thiserror::Error;
 use tower_http::BoxError;
@@ -153,7 +156,7 @@ pub enum MojangRequestError {
     MojangFetchRequestError(String),
     #[error("Unable to resolve render request entity {1:?}: {0}")]
     UnableToResolveRenderRequestEntity(
-        Box<dyn std::error::Error + Send + Sync>,
+        Box<NMSRaaSError>,
         crate::model::request::entry::RenderRequestEntry,
     ),
     #[error("Unable to parse uuid {0} into xuid")]
@@ -164,6 +167,62 @@ pub enum MojangRequestError {
     GameProfileNotFound(Uuid),
     #[error("Unable to find a player with the name \"{0}\"")]
     NamedGameProfileNotFound(String),
+    #[error("{host} is rate limiting requests; retrying after {}s", retry_after.as_secs())]
+    UpstreamRateLimited { host: String, retry_after: Duration },
+    #[error("{host} responded with {status}")]
+    UpstreamStatus { host: String, status: StatusCode },
+}
+
+/// How a failed request should be treated by callers and clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    BadRequest,
+    /// Upstream answered definitively that the player or texture does not exist.
+    NotFound,
+    /// Upstream could not answer right now; the same request may succeed later.
+    Unavailable {
+        retry_after: Option<Duration>,
+    },
+    Internal,
+}
+
+impl FailureKind {
+    #[must_use]
+    pub const fn is_definitive_absence(self) -> bool {
+        matches!(self, Self::BadRequest | Self::NotFound)
+    }
+}
+
+impl MojangRequestError {
+    #[must_use]
+    pub fn failure_kind(&self) -> FailureKind {
+        match self {
+            Self::GameProfileNotFound(_)
+            | Self::NamedGameProfileNotFound(_)
+            | Self::InvalidTextureHashError(_)
+            | Self::MissingSkinPropertyError(_)
+            | Self::UnableToParseUuidIntoXuid(_) => FailureKind::NotFound,
+            Self::UpstreamRateLimited { retry_after, .. } => FailureKind::Unavailable {
+                retry_after: Some(*retry_after),
+            },
+            Self::UnableToResolveRenderRequestEntity(inner, _) => inner.failure_kind(),
+            _ => FailureKind::Unavailable { retry_after: None },
+        }
+    }
+}
+
+impl NMSRaaSError {
+    #[must_use]
+    pub fn failure_kind(&self) -> FailureKind {
+        match self {
+            Self::MojangRequestError(error) => error.failure_kind(),
+            Self::RenderRequestError(error) if error.is_bad_request() => FailureKind::BadRequest,
+            Self::RenderRequestError(RenderRequestError::MissingTexture(_)) => {
+                FailureKind::NotFound
+            }
+            _ => FailureKind::Internal,
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -222,33 +281,27 @@ impl IntoResponse for NMSRaaSError {
     fn into_response(self) -> axum::response::Response {
         let mut res = axum::response::IntoResponse::into_response(self.to_string());
 
-        let is_bad_request = if let Self::RenderRequestError(error) = &self {
-            error.is_bad_request()
-        } else {
-            false
+        let failure = self.failure_kind();
+        *res.status_mut() = match failure {
+            FailureKind::BadRequest => StatusCode::BAD_REQUEST,
+            FailureKind::NotFound => StatusCode::NOT_FOUND,
+            FailureKind::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            FailureKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        #[rustfmt::skip]
-        let is_not_found = matches!(
-            self,
-            Self::MojangRequestError(MojangRequestError::GameProfileNotFound(_))
-                | Self::MojangRequestError(MojangRequestError::UnableToResolveRenderRequestEntity(_,_))
-                | Self::RenderRequestError(RenderRequestError::MissingTexture(_))
-        );
+        let headers = res.headers_mut();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
-        let error = if is_bad_request {
-            StatusCode::BAD_REQUEST
-        } else if is_not_found {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-
-        if let Ok(version_header_value) = HeaderValue::from_str(env!("VERGEN_IS_LITERALLY_TRASH__IT_DOES_NOT_WORK_AND_IT_ACTUALLY_BREAKS_EVERY_TIME_I_UPDATE_IT__LIKE_SERIOUSLY_HOW_IS_THAT_POSSIBLE___STOP_CHANGING_THE_DAMN_IMPLEMENTATION___I_JUST_WANT_A_STUPID_GIT_HASH")) {
-            res.headers_mut().insert(NMSR_VERSION_HEADER, version_header_value);
+        if let FailureKind::Unavailable {
+            retry_after: Some(retry_after),
+        } = failure
+        {
+            headers.insert(RETRY_AFTER, HeaderValue::from(retry_after.as_secs().max(1)));
         }
 
-        *res.status_mut() = error;
+        if let Ok(version_header_value) = HeaderValue::from_str(env!("VERGEN_IS_LITERALLY_TRASH__IT_DOES_NOT_WORK_AND_IT_ACTUALLY_BREAKS_EVERY_TIME_I_UPDATE_IT__LIKE_SERIOUSLY_HOW_IS_THAT_POSSIBLE___STOP_CHANGING_THE_DAMN_IMPLEMENTATION___I_JUST_WANT_A_STUPID_GIT_HASH")) {
+            headers.insert(NMSR_VERSION_HEADER, version_header_value);
+        }
 
         res.extensions_mut().insert(NmsrErrorExtension(self));
 

@@ -18,7 +18,7 @@ pub(crate) mod names;
 pub(crate) mod textures;
 
 use crate::{
-    caching::CacheSystem,
+    caching::{CacheSystem, Cached},
     config::ModelCacheConfiguration,
     model::resolver::{MojangTexture, ResolvedRenderEntryTextures},
 };
@@ -107,8 +107,13 @@ impl ModelCache {
         })
     }
 
+    /// Textures are content addressed, so a retained texture is valid whatever its age.
     pub async fn get_cached_texture(&self, texture_id: &str) -> Result<Option<MojangTexture>> {
-        self.mojang_textures.get_cached_entry(texture_id).await
+        Ok(self
+            .mojang_textures
+            .get_cached_entry(texture_id)
+            .await?
+            .map(|cached| cached.value))
     }
 
     pub async fn cache_texture(&self, texture: &MojangTexture) -> Result<()> {
@@ -125,7 +130,7 @@ impl ModelCache {
     pub async fn get_cached_resolved_texture(
         &self,
         entry: &RenderRequestEntry,
-    ) -> Result<Option<ResolvedRenderEntryTextures>> {
+    ) -> Result<Option<Cached<ResolvedRenderEntryTextures>>> {
         self.resolved_textures.get_cached_entry(entry).await
     }
 
@@ -147,7 +152,7 @@ impl ModelCache {
             .map(|_| ())
     }
 
-    pub async fn get_cached_resolved_name(&self, name: &str) -> Result<Option<Uuid>> {
+    pub async fn get_cached_resolved_name(&self, name: &str) -> Result<Option<Cached<Uuid>>> {
         self.resolved_names.get_cached_entry(name).await
     }
 

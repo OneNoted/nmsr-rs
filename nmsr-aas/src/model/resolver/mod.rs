@@ -10,7 +10,8 @@ use super::request::{
 #[cfg(feature = "ears")]
 use crate::model::request::RenderRequestFeatures;
 use crate::{
-    error::{MojangRequestError, RenderRequestError, Result},
+    caching::{Cached, Freshness},
+    error::{FailureKind, MojangRequestError, NMSRaaSError, RenderRequestError, Result},
     model::resolver::{
         default_skins::DefaultSkinResolver, mojang::client::MojangTextureRequestType,
     },
@@ -21,9 +22,13 @@ use ears_rs::{alfalfa::AlfalfaDataKey, features::EarsFeatures, parser::EarsParse
 #[cfg(feature = "ears")]
 use nmsr_rendering::high_level::parts::provider::ears::PlayerPartEarsTextureType;
 use nmsr_rendering::high_level::types::PlayerPartTextureType;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::Hash,
+    sync::{Arc, PoisonError, Weak},
+};
 use strum::EnumCount;
-use tracing::{instrument, trace_span, Instrument, Span};
+use tracing::{instrument, trace_span, warn, Instrument, Span};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -31,9 +36,38 @@ pub mod default_skins;
 pub mod geyser;
 pub mod mojang;
 
+#[cfg(test)]
+mod tests;
+
 pub struct RenderRequestResolver {
     model_cache: ModelCache,
     mojang_requests_client: Arc<MojangClient>,
+    in_flight: KeyedLocks<RenderRequestEntry>,
+}
+
+/// Serializes work per key, so identical concurrent requests share one upstream fetch
+/// and never observe each other's cache rewrite.
+struct KeyedLocks<K>(std::sync::Mutex<HashMap<K, Weak<tokio::sync::Mutex<()>>>>);
+
+impl<K: Eq + Hash + Clone> KeyedLocks<K> {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    async fn lock(&self, key: &K) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+
+            locks.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key.clone(), Arc::downgrade(&lock));
+                lock
+            })
+        };
+
+        lock.lock_owned().await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -217,6 +251,7 @@ impl RenderRequestResolver {
         Self {
             model_cache,
             mojang_requests_client: client,
+            in_flight: KeyedLocks::new(),
         }
     }
 
@@ -266,50 +301,105 @@ impl RenderRequestResolver {
     async fn resolve_entry_textures(
         &self,
         entry: &RenderRequestEntry,
-    ) -> Result<ResolvedRenderEntryTextures> {
-        #[cfg_attr(not(feature = "ears"), allow(unused_mut))]
-        if let Some(mut result) = self.model_cache.get_cached_resolved_texture(entry).await? {
-            #[cfg(feature = "ears")]
-            if let Some(skin) = result
-                .textures
-                .remove(&ResolvedRenderEntryTextureType::Skin)
-            {
-                Self::resolve_ears_textures(&skin, &mut result.textures);
-                result
-                    .textures
-                    .insert(ResolvedRenderEntryTextureType::Skin, skin);
+    ) -> Result<Cached<ResolvedRenderEntryTextures>> {
+        if let RenderRequestEntry::MojangPlayerName(name) = entry {
+            let id = self.resolve_name(name).await?;
+            let mut resolved = Box::pin(
+                self.resolve_entry_textures(&RenderRequestEntry::MojangPlayerUuid(id.value)),
+            )
+            .await?;
+            resolved.freshness = resolved.freshness.max(id.freshness);
 
-                return Ok(result);
-            }
-
-            return Ok(result);
+            return Ok(resolved);
         }
 
+        let _in_flight = match entry {
+            RenderRequestEntry::PlayerSkin(_, _) => None,
+            entry => Some(self.in_flight.lock(entry).await),
+        };
+
+        let stale = match self
+            .model_cache
+            .get_cached_resolved_texture(entry)
+            .await?
+            .map(Self::with_derived_textures)
+        {
+            Some(cached) if cached.is_fresh() => return Ok(cached),
+            cached => cached,
+        };
+
+        let fetched = self.fetch_entry_textures(entry).await;
+
+        if let Ok(textures) = &fetched {
+            if let Err(error) = self
+                .model_cache
+                .cache_resolved_texture(entry, textures)
+                .await
+            {
+                warn!(%error, "Unable to cache resolved textures for {entry:?}");
+            }
+        }
+
+        stale_if_error(fetched, stale)
+    }
+
+    async fn resolve_name(&self, name: &str) -> Result<Cached<Uuid>> {
+        let _in_flight = self
+            .in_flight
+            .lock(&RenderRequestEntry::MojangPlayerName(name.to_owned()))
+            .await;
+
+        let stale = match self.model_cache.get_cached_resolved_name(name).await? {
+            Some(cached) if cached.is_fresh() => return Ok(cached),
+            cached => cached,
+        };
+
+        let fetched = self
+            .mojang_requests_client
+            .resolve_name_to_uuid(name)
+            .await
+            .map_err(NMSRaaSError::from);
+
+        if let Ok(id) = &fetched {
+            if let Err(error) = self.model_cache.cache_resolved_name(name, *id).await {
+                warn!(%error, "Unable to cache resolved name {name:?}");
+            }
+        }
+
+        stale_if_error(fetched, stale)
+    }
+
+    #[cfg_attr(not(feature = "ears"), allow(unused_mut))]
+    fn with_derived_textures(
+        mut cached: Cached<ResolvedRenderEntryTextures>,
+    ) -> Cached<ResolvedRenderEntryTextures> {
+        #[cfg(feature = "ears")]
+        if let Some(skin) = cached
+            .value
+            .textures
+            .remove(&ResolvedRenderEntryTextureType::Skin)
+        {
+            Self::resolve_ears_textures(&skin, &mut cached.value.textures);
+            cached
+                .value
+                .textures
+                .insert(ResolvedRenderEntryTextureType::Skin, skin);
+        }
+
+        cached
+    }
+
+    async fn fetch_entry_textures(
+        &self,
+        entry: &RenderRequestEntry,
+    ) -> Result<ResolvedRenderEntryTextures> {
         let model: Option<RenderRequestEntryModel>;
         let skin_texture: Option<MojangTexture>;
         let cape_texture: Option<MojangTexture>;
 
         match &entry {
-            RenderRequestEntry::MojangPlayerName(name) => {
-                let cached_id = self.model_cache.get_cached_resolved_name(name).await?;
-
-                let id = if let Some(id) = cached_id {
-                    id
-                } else {
-                    let id = self
-                        .mojang_requests_client
-                        .resolve_name_to_uuid(name)
-                        .await?;
-
-                    self.model_cache.cache_resolved_name(name, id).await?;
-
-                    id
-                };
-
-                return Box::pin(
-                    self.resolve_entry_textures(&RenderRequestEntry::MojangPlayerUuid(id)),
-                )
-                .await;
+            RenderRequestEntry::MojangPlayerName(_) => {
+                unreachable!("player names are resolved to a UUID before fetching textures")
             }
             RenderRequestEntry::MojangPlayerUuid(id)
             | RenderRequestEntry::MojangOfflinePlayerUuid(id) => {
@@ -412,13 +502,7 @@ impl RenderRequestResolver {
                 .or_insert(skin_texture);
         }
 
-        let result = ResolvedRenderEntryTextures::new(textures, model);
-
-        self.model_cache
-            .cache_resolved_texture(entry, &result)
-            .await?;
-
-        Ok(result)
+        Ok(ResolvedRenderEntryTextures::new(textures, model))
     }
 
     #[cfg(feature = "ears")]
@@ -578,62 +662,54 @@ impl RenderRequestResolver {
     }
 
     pub async fn resolve(&self, request: &RenderRequest) -> Result<ResolvedRenderRequest> {
-        let resolved = self.resolve_raw(request).await;
+        let error = match self.resolve_raw(request).await {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => error,
+        };
 
-        // TODO: Clean-up this code.
-        if let Err(_) = &resolved {
-            if self
-                .mojang_requests_client
+        let fallback_uuid = match &request.entry {
+            RenderRequestEntry::GeyserPlayerUuid(u)
+            | RenderRequestEntry::MojangOfflinePlayerUuid(u)
+            | RenderRequestEntry::MojangPlayerUuid(u) => Some(*u),
+            RenderRequestEntry::MojangPlayerName(name) => Some(Uuid::from_u128(xxh3_128(
+                name.to_ascii_lowercase().as_bytes(),
+            ))),
+            RenderRequestEntry::TextureHash(_)
+            | RenderRequestEntry::DefaultSkinTextureHash(_)
+            | RenderRequestEntry::PlayerSkin(_, _) => None,
+        };
+
+        let Some(uuid) = fallback_uuid.filter(|_| {
+            self.mojang_requests_client
                 .mojank_config()
                 .use_default_skins_when_missing
-            {
-                let uuid = match &request.entry {
-                    RenderRequestEntry::GeyserPlayerUuid(u)
-                    | RenderRequestEntry::MojangOfflinePlayerUuid(u)
-                    | RenderRequestEntry::MojangPlayerUuid(u) => Some(*u),
-                    RenderRequestEntry::TextureHash(_)
-                    | RenderRequestEntry::DefaultSkinTextureHash(_)
-                    | RenderRequestEntry::PlayerSkin(_, _) => None,
-                    RenderRequestEntry::MojangPlayerName(_) => Some(Uuid::new_v4()),
-                };
+        }) else {
+            return Err(error);
+        };
 
-                if let Some(uuid) = uuid {
-                    let optional_slim_model =
-                        request.model.map(|m| m == RenderRequestEntryModel::Alex);
+        let reason = FallbackReason::from(error.failure_kind());
+        warn!(?reason, %error, "Rendering a default skin for {:?}", request.entry);
 
-                    let (default_skin, is_default_slim) =
-                        DefaultSkinResolver::resolve_default_skin_for_uuid_parts(
-                            uuid,
-                            optional_slim_model,
-                        );
+        let optional_slim_model = request.model.map(|m| m == RenderRequestEntryModel::Alex);
+        let (default_skin, is_default_slim) =
+            DefaultSkinResolver::resolve_default_skin_for_uuid_parts(uuid, optional_slim_model);
 
-                    let new_entry =
-                        RenderRequestEntry::default_skin_hash(default_skin, is_default_slim);
+        let mut new_request = request.clone();
+        new_request.entry = RenderRequestEntry::default_skin_hash(default_skin, is_default_slim);
 
-                    // I didn't really want to clone the entire request, but I don't see a way around it.
-                    let mut new_request = request.clone();
-                    new_request.entry = new_entry;
+        let mut result = self.resolve_raw(&new_request).await?;
+        result.model = if is_default_slim {
+            RenderRequestEntryModel::Alex
+        } else {
+            RenderRequestEntryModel::Steve
+        };
+        result.source = TextureSource::Fallback(reason);
 
-                    let mut result = self.resolve_raw(&new_request).await?;
-                    // Hijhack the model to be the same as the original request.
-                    result.model = if is_default_slim {
-                        RenderRequestEntryModel::Alex
-                    } else {
-                        RenderRequestEntryModel::Steve
-                    };
-                    result.is_fallback_textures = true;
-
-                    return Ok(result);
-                }
-            }
-        }
-
-        resolved
+        Ok(result)
     }
 
     async fn resolve_raw(&self, request: &RenderRequest) -> Result<ResolvedRenderRequest> {
-        // First, we need to resolve the skin and cape textures.
-        let resolved_textures = self
+        let resolved = self
             .resolve_entry_textures(&request.entry)
             .await
             .map_err(|e| {
@@ -642,6 +718,12 @@ impl RenderRequestResolver {
                     request.entry.clone(),
                 )
             })?;
+
+        let source = match resolved.freshness {
+            Freshness::Fresh => TextureSource::Current,
+            Freshness::Stale => TextureSource::LastKnownGood,
+        };
+        let resolved_textures = resolved.value;
 
         let final_model = request
             .model
@@ -666,7 +748,7 @@ impl RenderRequestResolver {
         Ok(ResolvedRenderRequest {
             model: final_model,
             textures,
-            is_fallback_textures: false,
+            source,
         })
     }
 
@@ -676,10 +758,50 @@ impl RenderRequestResolver {
     }
 }
 
+/// Uses `stale` in place of a failed refresh, unless upstream definitively said the subject is gone.
+fn stale_if_error<T>(fetched: Result<T>, stale: Option<Cached<T>>) -> Result<Cached<T>> {
+    match (fetched, stale) {
+        (Ok(value), _) => Ok(Cached::fresh(value)),
+        (Err(error), Some(stale)) if !error.failure_kind().is_definitive_absence() => {
+            warn!(%error, "Serving last known good result while upstream is unavailable");
+            Ok(Cached::stale(stale.value))
+        }
+        (Err(error), _) => Err(error),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// Mojang answered that the player does not exist.
+    PlayerNotFound,
+    /// Mojang could not be asked or did not answer; the real skin may resolve on retry.
+    UpstreamUnavailable,
+}
+
+impl From<FailureKind> for FallbackReason {
+    fn from(kind: FailureKind) -> Self {
+        if kind.is_definitive_absence() {
+            Self::PlayerNotFound
+        } else {
+            Self::UpstreamUnavailable
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureSource {
+    /// Resolved from Mojang within its cache lifetime.
+    Current,
+    /// An expired resolution, served because Mojang could not answer the refresh.
+    LastKnownGood,
+    /// A default skin substituted for the requested player.
+    Fallback(FallbackReason),
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedRenderRequest {
     pub model: RenderRequestEntryModel,
     #[debug(skip)]
     pub textures: BTreeMap<ResolvedRenderEntryTextureType, Vec<u8>>,
-    pub is_fallback_textures: bool,
+    pub source: TextureSource,
 }

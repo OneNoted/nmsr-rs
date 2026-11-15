@@ -1,5 +1,5 @@
 use axum::http::{HeaderName, HeaderValue};
-use http::StatusCode;
+use http::{header::RETRY_AFTER, HeaderMap, StatusCode};
 use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Method, Request};
 use hyper_tls::{native_tls::TlsConnector, HttpsConnector};
@@ -8,9 +8,11 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use std::{
+    collections::HashMap,
     future::{ready, Ready},
     net::IpAddr,
-    time::Duration,
+    sync::{Mutex, PoisonError},
+    time::{Duration, Instant, SystemTime},
 };
 use tower::{
     balance::p2c::Balance,
@@ -62,7 +64,7 @@ pub(crate) type HttpClientInnerService =
         >>::Future,
     >;
 
-pub enum NmsrHttpClient {
+pub enum HttpTransport {
     SingleIp {
         inner: HttpClientInnerService,
     },
@@ -78,6 +80,63 @@ pub enum NmsrHttpClient {
     },
 }
 
+pub struct NmsrHttpClient {
+    transport: HttpTransport,
+    backoff: UpstreamBackoff,
+}
+
+/// Wait used when an upstream answers 429 without a usable `Retry-After`.
+const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
+/// Upper bound so a hostile or buggy `Retry-After` cannot disable a host for long.
+const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// Per-host deadlines before which requests are refused locally instead of sent,
+/// so a rate-limited upstream is not asked again until it said it would answer.
+#[derive(Default)]
+struct UpstreamBackoff(Mutex<HashMap<String, Instant>>);
+
+impl UpstreamBackoff {
+    fn remaining(&self, host: &str) -> Option<Duration> {
+        let mut deadlines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let remaining = deadlines
+            .get(host)
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+
+        match remaining {
+            Some(remaining) if !remaining.is_zero() => Some(remaining),
+            Some(_) => {
+                deadlines.remove(host);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn defer(&self, host: &str, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        let mut deadlines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = deadlines.entry(host.to_owned()).or_insert(deadline);
+        *entry = (*entry).max(deadline);
+    }
+}
+
+/// Reads `Retry-After` as delta-seconds or an HTTP-date, bounded by [`MAX_RATE_LIMIT_BACKOFF`].
+fn retry_after(headers: &HeaderMap, now: SystemTime) -> Duration {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .and_then(|value| {
+            value.parse().map(Duration::from_secs).ok().or_else(|| {
+                httpdate::parse_http_date(value)
+                    .ok()
+                    .map(|at| at.duration_since(now).unwrap_or_default())
+            })
+        })
+        .unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF)
+        .min(MAX_RATE_LIMIT_BACKOFF)
+}
+
 impl NmsrHttpClient {
     pub fn new(
         rate_limit_per_second: u64,
@@ -86,22 +145,27 @@ impl NmsrHttpClient {
         client_ips: &[IpAddr],
         user_agent: Option<&str>,
     ) -> Self {
-        create_http_client(
-            rate_limit_per_second,
-            request_timeout_seconds,
-            request_retries_count,
-            client_ips,
-            user_agent,
-        )
+        Self {
+            transport: create_http_client(
+                rate_limit_per_second,
+                request_timeout_seconds,
+                request_retries_count,
+                client_ips,
+                user_agent,
+            ),
+            backoff: UpstreamBackoff::default(),
+        }
     }
 
-    #[instrument(skip(self, parent_span, on_error), parent = parent_span, err)]
+    /// Fetches `url`, mapping 204 and 404 to `not_found()` and every other non-200 answer
+    /// to an upstream error that callers treat as transient.
+    #[instrument(skip(self, parent_span, not_found), parent = parent_span, err)]
     pub(crate) async fn do_request(
         &self,
         url: &str,
         method: Method,
         parent_span: &Span,
-        on_error: impl FnOnce() -> Option<MojangRequestError>,
+        not_found: impl FnOnce() -> MojangRequestError,
     ) -> MojangRequestResult<Bytes> {
         let request = Request::builder()
             .method(method)
@@ -110,43 +174,51 @@ impl NmsrHttpClient {
                 unreachable!("Empty body should not error: {}", e)
             })))?;
 
-        let response = if let NmsrHttpClient::SingleIp { inner } = self {
-            let mut svc = inner.clone();
+        let host = request
+            .uri()
+            .authority()
+            .map_or_else(String::new, ToString::to_string);
 
-            let service = svc
-                .ready()
-                .await
-                .map_err(MojangRequestError::BoxedRequestError)?;
-
-            service
-                .call(request)
-                .await
-                .map_err(MojangRequestError::BoxedRequestError)?
-        } else if let NmsrHttpClient::LoadBalanced { inner } = self {
-            let mut svc = inner.clone();
-
-            let service = svc
-                .ready()
-                .await
-                .map_err(MojangRequestError::BoxedRequestError)?;
-
-            service
-                .call(request)
-                .await
-                .map_err(MojangRequestError::BoxedRequestError)?
-        } else {
-            unreachable!("Invalid NmsrHttpClient variant")
-        };
-
-        if response.status() != StatusCode::OK {
-            if let Some(err) = on_error() {
-                return Err(err);
-            }
+        if let Some(retry_after) = self.backoff.remaining(&host) {
+            return Err(MojangRequestError::UpstreamRateLimited { host, retry_after });
         }
 
-        let body = response.into_body();
+        let response = match &self.transport {
+            HttpTransport::SingleIp { inner } => {
+                inner
+                    .clone()
+                    .ready()
+                    .await
+                    .map_err(MojangRequestError::BoxedRequestError)?
+                    .call(request)
+                    .await
+            }
+            HttpTransport::LoadBalanced { inner } => {
+                inner
+                    .clone()
+                    .ready()
+                    .await
+                    .map_err(MojangRequestError::BoxedRequestError)?
+                    .call(request)
+                    .await
+            }
+        }
+        .map_err(MojangRequestError::BoxedRequestError)?;
 
-        body.collect()
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => return Err(not_found()),
+            StatusCode::TOO_MANY_REQUESTS => {
+                let retry_after = retry_after(response.headers(), SystemTime::now());
+                self.backoff.defer(&host, retry_after);
+                return Err(MojangRequestError::UpstreamRateLimited { host, retry_after });
+            }
+            status => return Err(MojangRequestError::UpstreamStatus { host, status }),
+        }
+
+        response
+            .into_body()
+            .collect()
             .await
             .map(|b| b.to_bytes())
             .map_err(|e| MojangRequestError::BoxedRequestError(Box::new(e)))
@@ -159,7 +231,7 @@ fn create_http_client(
     request_retries_count: usize,
     client_ips: &[IpAddr],
     user_agent: Option<&str>,
-) -> NmsrHttpClient {
+) -> HttpTransport {
     if client_ips.is_empty() {
         create_http_client_internal(
             rate_limit_per_second,
@@ -189,7 +261,7 @@ fn create_http_client(
                 )
             })
             .flat_map(|svc| {
-                if let NmsrHttpClient::SingleIp { inner } = svc {
+                if let HttpTransport::SingleIp { inner } = svc {
                     Some(inner)
                 } else {
                     None
@@ -211,7 +283,7 @@ fn create_http_client(
             .check_clone()
             .service(balanced);
 
-        NmsrHttpClient::LoadBalanced { inner: balanced }
+        HttpTransport::LoadBalanced { inner: balanced }
     }
 }
 
@@ -221,7 +293,7 @@ fn create_http_client_internal(
     request_retries_count: usize,
     client_ip: Option<IpAddr>,
     user_agent: Option<&str>,
-) -> NmsrHttpClient {
+) -> HttpTransport {
     let mut http = HttpConnector::new();
     http.set_nodelay(true);
     http.enforce_http(false);
@@ -258,7 +330,7 @@ fn create_http_client_internal(
         .check_clone()
         .service(client);
 
-    NmsrHttpClient::SingleIp { inner: service }
+    HttpTransport::SingleIp { inner: service }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -384,5 +456,71 @@ where
             trace!("Outgoing request from IP: {}", ip);
         }
         self.inner.call(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(retry_after: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(retry_after).unwrap());
+        headers
+    }
+
+    fn now() -> SystemTime {
+        httpdate::parse_http_date("Sun, 15 Nov 2026 14:00:00 GMT").unwrap()
+    }
+
+    #[test]
+    fn retry_after_uses_delta_seconds_and_caps_them() {
+        assert_eq!(retry_after(&headers("7"), now()), Duration::from_secs(7));
+        assert_eq!(
+            retry_after(&headers("86400"), now()),
+            MAX_RATE_LIMIT_BACKOFF
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_http_dates() {
+        let at = |date| retry_after(&headers(date), now());
+
+        assert_eq!(at("Sun, 15 Nov 2026 14:00:45 GMT"), Duration::from_secs(45));
+        assert_eq!(at("Sun, 15 Nov 2026 13:59:00 GMT"), Duration::ZERO);
+        assert_eq!(at("Mon, 16 Nov 2026 14:00:00 GMT"), MAX_RATE_LIMIT_BACKOFF);
+    }
+
+    #[test]
+    fn retry_after_defaults_when_missing_or_unparseable() {
+        assert_eq!(
+            retry_after(&HeaderMap::new(), now()),
+            DEFAULT_RATE_LIMIT_BACKOFF
+        );
+        assert_eq!(
+            retry_after(&headers("soon"), now()),
+            DEFAULT_RATE_LIMIT_BACKOFF
+        );
+    }
+
+    #[test]
+    fn backoff_blocks_only_the_deferred_host_until_its_deadline() {
+        let backoff = UpstreamBackoff::default();
+        backoff.defer("api.mojang.com", Duration::from_secs(30));
+
+        assert!(backoff.remaining("api.mojang.com").is_some());
+        assert!(backoff.remaining("sessionserver.mojang.com").is_none());
+
+        backoff.defer("textures.minecraft.net", Duration::ZERO);
+        assert!(backoff.remaining("textures.minecraft.net").is_none());
+    }
+
+    #[test]
+    fn backoff_keeps_the_later_deadline() {
+        let backoff = UpstreamBackoff::default();
+        backoff.defer("api.mojang.com", Duration::from_secs(60));
+        backoff.defer("api.mojang.com", Duration::from_secs(1));
+
+        assert!(backoff.remaining("api.mojang.com").unwrap() > Duration::from_secs(30));
     }
 }

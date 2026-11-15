@@ -67,14 +67,14 @@ impl MojangClient {
         url: &str,
         method: Method,
         parent_span: &Span,
-        on_error: impl FnOnce() -> Option<MojangRequestError>,
+        not_found: impl FnOnce() -> MojangRequestError,
     ) -> MojangRequestResult<Bytes> {
         let client = match kind {
             MojangClientKind::SessionServer => &self.session_server_client,
             MojangClientKind::NameLookup => &self.name_lookup_client,
         };
 
-        client.do_request(url, method, parent_span, on_error).await
+        client.do_request(url, method, parent_span, not_found).await
     }
 
     pub async fn resolve_name_to_uuid<'a>(&self, name: &'a str) -> MojangRequestResult<Uuid> {
@@ -90,16 +90,11 @@ impl MojangClient {
                 &url,
                 Method::GET,
                 &Span::current(),
-                || {
-                    Some(MojangRequestError::NamedGameProfileNotFound(
-                        name.to_owned(),
-                    ))
-                },
+                || MojangRequestError::NamedGameProfileNotFound(name.to_owned()),
             )
             .await?;
 
-        let result: UsernameToUuidResponse = serde_json::from_slice(&bytes)
-            .map_err(|_| MojangRequestError::NamedGameProfileNotFound(name.to_owned()))?;
+        let result: UsernameToUuidResponse = serde_json::from_slice(&bytes)?;
 
         Ok(result.id())
     }
@@ -125,7 +120,7 @@ impl MojangClient {
                 &url,
                 Method::GET,
                 &Span::current(),
-                || Some(MojangRequestError::GameProfileNotFound(id.to_owned())),
+                || MojangRequestError::GameProfileNotFound(id.to_owned()),
             )
             .await?;
 
@@ -148,11 +143,7 @@ impl MojangClient {
                 &url,
                 Method::GET,
                 &Span::current(),
-                || {
-                    Some(MojangRequestError::InvalidTextureHashError(
-                        texture_id.to_string(),
-                    ))
-                },
+                || MojangRequestError::InvalidTextureHashError(texture_id.to_string()),
             )
             .await?;
 
