@@ -37,7 +37,7 @@ pub async fn resolve_geyser_uuid_to_texture_and_model(
             &url,
             Method::GET,
             &Span::current(),
-            || None,
+            || MojangRequestError::GameProfileNotFound(*uuid),
         )
         .await?;
 

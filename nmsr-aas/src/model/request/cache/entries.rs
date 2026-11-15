@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::BTreeMap, fs::Metadata, path::Path, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio::fs;
@@ -59,14 +59,12 @@ impl CacheHandler<RenderRequestEntry, ResolvedRenderEntryTextures, ModelCacheCon
             .ok())
     }
 
-    fn is_expired(
-        &self,
-        entry: &RenderRequestEntry,
-        config: &ModelCacheConfiguration,
-        _marker: &[u8; 1],
-        marker_metadata: Metadata,
-    ) -> Result<bool> {
-        config.is_expired(entry, &marker_metadata)
+    fn fresh_for(&self, entry: &RenderRequestEntry, config: &ModelCacheConfiguration) -> Duration {
+        *config.get_cache_duration(entry)
+    }
+
+    fn retain_stale_for(&self, config: &ModelCacheConfiguration) -> Duration {
+        config.stale_if_error_duration
     }
 
     async fn write_cache(

@@ -33,6 +33,13 @@ resolve_cache_duration = "15m"
 # even if the player's UUID wasn't requested for some time.
 texture_cache_duration = "48h"
 
+# How long an expired name or player resolution is kept after its lifetime ends.
+# The expired result is only served while Mojang cannot answer (rate limited, erroring or unreachable),
+# so players who were seen before keep their skin instead of getting a default one.
+# Textures are kept for the same extra time after their last use, so on-disk textures now live for
+# texture_cache_duration + stale_if_error_duration (96h by default) after the last player that used them.
+stale_if_error_duration = "48h"
+
 # Cache biases for specific entries.
 # A cache bias is a duration of time to keep a specific entry in the cache.
 # This is useful for entries that are requested often, such as the models in the home page.

@@ -18,8 +18,9 @@ pub(crate) mod names;
 pub(crate) mod textures;
 
 use crate::{
-    caching::CacheSystem,
+    caching::{renew, CacheSystem, Cached},
     config::ModelCacheConfiguration,
+    error::ExplainableExt,
     model::resolver::{MojangTexture, ResolvedRenderEntryTextures},
 };
 
@@ -107,8 +108,13 @@ impl ModelCache {
         })
     }
 
+    /// Textures are content addressed, so a stale texture is still the right texture.
     pub async fn get_cached_texture(&self, texture_id: &str) -> Result<Option<MojangTexture>> {
-        self.mojang_textures.get_cached_entry(texture_id).await
+        Ok(self
+            .mojang_textures
+            .get_cached_entry(texture_id)
+            .await?
+            .map(|cached| cached.value))
     }
 
     pub async fn cache_texture(&self, texture: &MojangTexture) -> Result<()> {
@@ -125,7 +131,7 @@ impl ModelCache {
     pub async fn get_cached_resolved_texture(
         &self,
         entry: &RenderRequestEntry,
-    ) -> Result<Option<ResolvedRenderEntryTextures>> {
+    ) -> Result<Option<Cached<ResolvedRenderEntryTextures>>> {
         self.resolved_textures.get_cached_entry(entry).await
     }
 
@@ -140,6 +146,14 @@ impl ModelCache {
             .map(|_| ())
     }
 
+    pub async fn forget_resolved_texture(&self, entry: &RenderRequestEntry) -> Result<()> {
+        self.resolved_textures.remove_cache_entry(entry).await
+    }
+
+    pub async fn forget_resolved_name(&self, name: &str) -> Result<()> {
+        self.resolved_names.remove_cache_entry(name).await
+    }
+
     pub async fn cache_resolved_name(&self, name: &str, uuid: Uuid) -> Result<()> {
         self.resolved_names
             .set_cache_entry(name, &uuid)
@@ -147,14 +161,202 @@ impl ModelCache {
             .map(|_| ())
     }
 
-    pub async fn get_cached_resolved_name(&self, name: &str) -> Result<Option<Uuid>> {
+    pub async fn get_cached_resolved_name(&self, name: &str) -> Result<Option<Cached<Uuid>>> {
         self.resolved_names.get_cached_entry(name).await
     }
 
     pub(crate) async fn do_cache_clean_up(&self) -> Result<()> {
         self.resolved_textures.perform_cache_cleanup().await?;
+        self.renew_linked_textures().await?;
         self.mojang_textures.perform_cache_cleanup().await?;
 
         Ok(())
+    }
+
+    /// Resolved entries link to their textures, and may outlive the texture lifetime (cache biases, default
+    /// skins). Renewing every linked texture before cleanup keeps it while any entry still uses it.
+    async fn renew_linked_textures(&self) -> Result<()> {
+        let resolved = self.resolved_textures.base_path().to_owned();
+
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for entry in std::fs::read_dir(&resolved)? {
+                let entry = entry?.path();
+                if !entry.is_dir() {
+                    continue;
+                }
+                let Some(files) = unless_vanished(std::fs::read_dir(&entry))? else {
+                    continue;
+                };
+
+                for file in files {
+                    let file = file?.path();
+                    let linked = unless_vanished(file.symlink_metadata())?
+                        .is_some_and(|metadata| metadata.is_symlink());
+
+                    if linked {
+                        unless_vanished(renew(&file))?;
+                    }
+                }
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|renewed| renewed)
+        .explain("Unable to renew textures linked from resolved entries".to_owned())
+    }
+}
+
+/// Entries are replaced concurrently by refreshes, so anything may vanish mid-scan.
+fn unless_vanished<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        result => result.map(Some),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::resolver::ResolvedRenderEntryTextureType;
+    use std::{collections::BTreeMap, path::Path, time::SystemTime};
+
+    const DAY: Duration = Duration::from_hours(24);
+    const ACTIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const IDLE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn texture(hash: &str) -> MojangTexture {
+        MojangTexture::new_named(hash.to_owned(), b"\x89PNG\r\n\x1a\nfake".to_vec())
+    }
+
+    fn backdate(path: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_skins_stay_cached_through_cleanup() {
+        use crate::model::resolver::default_skins::{DefaultSkin, DefaultSkinResolver};
+
+        let dir = std::env::temp_dir().join(format!("nmsr-cache-test-{}", Uuid::new_v4()));
+        let hash = DefaultSkinResolver::resolve_default_skin(DefaultSkin::Steve, false);
+        let default_skin = RenderRequestEntry::DefaultSkinTextureHash(hash.to_owned());
+        let mut config = ModelCacheConfiguration::default();
+        config
+            .cache_biases
+            .insert(default_skin.clone(), CacheBias::CacheIndefinitely);
+        let cache = ModelCache::new(dir.clone(), config).await.unwrap();
+        let textures = BTreeMap::from([(ResolvedRenderEntryTextureType::Skin, texture(hash))]);
+
+        cache
+            .cache_resolved_texture(
+                &default_skin,
+                &ResolvedRenderEntryTextures::new(textures, None),
+            )
+            .await
+            .unwrap();
+        backdate(&dir.join("resolved").join(hash).join("marker"), 5 * DAY);
+        backdate(&dir.join("textures").join(hash), 5 * DAY);
+
+        cache.do_cache_clean_up().await.unwrap();
+
+        assert!(cache
+            .get_cached_resolved_texture(&default_skin)
+            .await
+            .unwrap()
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_skin_hashes_are_recognised_however_they_are_requested() {
+        use crate::model::resolver::default_skins::{DefaultSkin, DefaultSkinResolver};
+
+        let default = DefaultSkinResolver::resolve_default_skin(DefaultSkin::Alex, true);
+
+        assert_eq!(
+            RenderRequestEntry::try_from(default.to_owned()).unwrap(),
+            RenderRequestEntry::DefaultSkinTextureHash(default.to_owned())
+        );
+        assert_eq!(
+            RenderRequestEntry::try_from(ACTIVE.to_owned()).unwrap(),
+            RenderRequestEntry::TextureHash(ACTIVE.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn textures_linked_from_long_lived_entries_survive_cleanup() {
+        let dir = std::env::temp_dir().join(format!("nmsr-cache-test-{}", Uuid::new_v4()));
+        let player = RenderRequestEntry::MojangPlayerUuid(Uuid::new_v4());
+        let mut config = ModelCacheConfiguration::default();
+        config
+            .cache_biases
+            .insert(player.clone(), CacheBias::CacheIndefinitely);
+        let cache = ModelCache::new(dir.clone(), config).await.unwrap();
+        let textures = BTreeMap::from([(ResolvedRenderEntryTextureType::Skin, texture(ACTIVE))]);
+
+        cache
+            .cache_resolved_texture(&player, &ResolvedRenderEntryTextures::new(textures, None))
+            .await
+            .unwrap();
+        cache.cache_texture(&texture(IDLE)).await.unwrap();
+        backdate(&dir.join("textures").join(ACTIVE), 5 * DAY);
+        backdate(&dir.join("textures").join(IDLE), 5 * DAY);
+
+        cache.do_cache_clean_up().await.unwrap();
+
+        let player_skin = cache.get_cached_resolved_texture(&player).await.unwrap();
+        assert!(player_skin.is_some_and(|cached| cached
+            .value
+            .textures
+            .contains_key(&ResolvedRenderEntryTextureType::Skin)));
+        assert!(cache.get_cached_texture(IDLE).await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn textures_still_referenced_by_refreshed_players_survive_cleanup() {
+        let dir = std::env::temp_dir().join(format!("nmsr-cache-test-{}", Uuid::new_v4()));
+        let config = ModelCacheConfiguration {
+            resolve_cache_duration: Duration::ZERO,
+            ..Default::default()
+        };
+        let cache = ModelCache::new(dir.clone(), config).await.unwrap();
+        let player = RenderRequestEntry::MojangPlayerUuid(Uuid::new_v4());
+        let resolved = || {
+            let textures =
+                BTreeMap::from([(ResolvedRenderEntryTextureType::Skin, texture(ACTIVE))]);
+            ResolvedRenderEntryTextures::new(textures, None)
+        };
+
+        cache
+            .cache_resolved_texture(&player, &resolved())
+            .await
+            .unwrap();
+        cache.cache_texture(&texture(IDLE)).await.unwrap();
+        backdate(&dir.join("textures").join(ACTIVE), 5 * DAY);
+        backdate(&dir.join("textures").join(IDLE), 5 * DAY);
+
+        cache
+            .cache_resolved_texture(&player, &resolved())
+            .await
+            .unwrap();
+        cache.do_cache_clean_up().await.unwrap();
+
+        let player_skin = cache.get_cached_resolved_texture(&player).await.unwrap();
+        assert!(player_skin.is_some_and(|cached| cached
+            .value
+            .textures
+            .contains_key(&ResolvedRenderEntryTextureType::Skin)));
+        assert!(cache.get_cached_texture(IDLE).await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

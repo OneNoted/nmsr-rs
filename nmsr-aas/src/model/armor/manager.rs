@@ -15,7 +15,7 @@ use tokio::fs;
 use tracing::Span;
 
 use crate::{
-    error::{ArmorManagerError, ArmorManagerResult, ExplainableExt, Result},
+    error::{ArmorManagerError, ArmorManagerResult, ExplainableExt, MojangRequestError, Result},
     model::armor::LeatherArmorColor,
     utils::http_client::NmsrHttpClient,
 };
@@ -156,7 +156,9 @@ impl VanillaMinecraftArmorManager {
 
                     let bytes = self
                         .client
-                        .do_request(&url, Method::GET, &Span::current(), || None)
+                        .do_request(&url, Method::GET, &Span::current(), || {
+                            MojangRequestError::InvalidTextureUrlError(url.clone())
+                        })
                         .await?;
 
                     fs::write(&layer_path, bytes)
@@ -191,7 +193,9 @@ impl VanillaMinecraftArmorManager {
 
                     let bytes = self
                         .client
-                        .do_request(&url, Method::GET, &Span::current(), || None)
+                        .do_request(&url, Method::GET, &Span::current(), || {
+                            MojangRequestError::InvalidTextureUrlError(url.clone())
+                        })
                         .await?;
 
                     fs::write(&layer_path, bytes).await.explain(format!(

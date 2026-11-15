@@ -5,10 +5,7 @@ use axum::{
     http::HeaderValue,
     response::{IntoResponse, Response},
 };
-use hyper::{
-    header::{CONTENT_DISPOSITION, CONTENT_TYPE},
-    Method,
-};
+use hyper::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use nmsr_rendering::high_level::{
     pipeline::{scene::Scene, SceneContextWrapper},
     types::PlayerPartTextureType,
@@ -25,6 +22,7 @@ use crate::{
     model::{
         armor::VanillaMinecraftArmorMaterialData,
         request::{RenderRequest, RenderRequestFeatures},
+        resolver::ResolvedRenderRequest,
     },
     routes::render_model::create_part_context,
     utils::png::create_png_from_bytes,
@@ -56,23 +54,12 @@ impl ModelProjectImageIO for NMSRaaSImageIO {
     }
 }
 
-#[axum::debug_handler]
-#[instrument(skip(state, method))]
+#[instrument(skip(state, resolved))]
 pub(crate) async fn internal_bbmodel_export(
-    state: State<NMSRState<'static>>,
-    method: Method,
+    state: &State<NMSRState<'static>>,
     mut request: RenderRequest,
+    resolved: ResolvedRenderRequest,
 ) -> Result<Response> {
-    let resolved = state.resolver.resolve(&request).await?;
-
-    if method == Method::HEAD {
-        return Ok(([(
-            CONTENT_TYPE,
-            HeaderValue::from_static(APPLICATION_JSON_MIME),
-        )])
-        .into_response());
-    }
-
     let mut part_context = create_part_context(&mut request, &resolved);
 
     if let Some(pos) = part_context.shadow_y_pos {

@@ -1,8 +1,8 @@
 use std::{
     borrow::Cow,
-    fs::Metadata,
     marker::PhantomData,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -11,7 +11,76 @@ use tokio::fs;
 use tokio_stream::{wrappers::ReadDirStream, StreamExt};
 use tracing::{instrument, trace, trace_span, Instrument, Span};
 
-use crate::error::{ExplainableExt, Result};
+use crate::error::{ExplainableExt, NMSRaaSError, RenderRequestError, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Freshness {
+    Fresh,
+    /// Past its freshness lifetime but still retained, so it can stand in when the source is unavailable.
+    Stale,
+}
+
+#[derive(Debug)]
+pub struct Cached<V> {
+    pub value: V,
+    pub freshness: Freshness,
+}
+
+impl<V> Cached<V> {
+    pub const fn fresh(value: V) -> Self {
+        Self {
+            value,
+            freshness: Freshness::Fresh,
+        }
+    }
+
+    pub const fn stale(value: V) -> Self {
+        Self {
+            value,
+            freshness: Freshness::Stale,
+        }
+    }
+
+    pub fn is_fresh(&self) -> bool {
+        self.freshness == Freshness::Fresh
+    }
+}
+
+/// An entry removed while being read (by cleanup or a concurrent refresh) is a miss, not a failure.
+fn unless_vanished<T>(result: Result<Option<T>>) -> Result<Option<T>> {
+    match result {
+        Err(NMSRaaSError::RenderRequestError(RenderRequestError::ExplainedIoError(error, _)))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+/// Restarts an entry's lifetime, so content still referenced by other entries is not cleaned up.
+pub(crate) fn renew(marker_path: &Path) -> std::io::Result<()> {
+    std::fs::File::options()
+        .write(true)
+        .open(marker_path)?
+        .set_modified(SystemTime::now())
+}
+
+/// Classifies an entry of the given age; `None` means it is past retention and should be deleted.
+/// A `fresh_for` of [`Duration::MAX`] never expires.
+fn freshness_at(
+    age: Duration,
+    fresh_for: Duration,
+    retain_stale_for: Duration,
+) -> Option<Freshness> {
+    if age < fresh_for {
+        Some(Freshness::Fresh)
+    } else if age < fresh_for.saturating_add(retain_stale_for) {
+        Some(Freshness::Stale)
+    } else {
+        None
+    }
+}
 
 pub struct CacheSystem<Key, ResultEntry, Config, Marker, Handler>
 where
@@ -43,16 +112,11 @@ where
     /// If the entry is not cached, this should return `None`.
     async fn get_cache_key(&self, entry: &Key, config: &Config) -> Result<Option<String>>;
 
-    /// Checks whether the given entry is expired.
-    ///
-    /// If the entry is expired, it will be removed from the cache if it exists.
-    fn is_expired(
-        &self,
-        entry: &Key,
-        config: &Config,
-        marker: &Marker,
-        marker_metadata: Metadata,
-    ) -> Result<bool>;
+    /// How long after being written the entry is fresh. [`Duration::MAX`] means forever.
+    fn fresh_for(&self, entry: &Key, config: &Config) -> Duration;
+
+    /// How long a no-longer-fresh entry is kept and returned as [`Freshness::Stale`] before deletion.
+    fn retain_stale_for(&self, config: &Config) -> Duration;
 
     /// Writes the given entry to the cache.
     async fn write_cache(
@@ -95,8 +159,8 @@ where
         marker: &Path,
     ) -> Result<()>;
 
-    /// Whether to always overwrite the cache entry if it exists.
-    fn always_overwrite(&self) -> bool {
+    /// Whether the key identifies the value's content, so an existing entry is renewed instead of replaced.
+    fn is_content_addressed(&self) -> bool {
         false
     }
 }
@@ -120,62 +184,51 @@ where
         })
     }
 
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
     pub async fn get_cache_entry_path(&self, entry: &Key) -> Result<Option<PathBuf>> {
         let key = self.handler.get_cache_key(entry, &self.config).await?;
 
         Ok(key.map(|k| self.base_path.join(k)))
     }
 
-    #[allow(clippy::missing_panics_doc)] // It doesn't panic, we check for None
-    pub async fn get_cached_entry(&self, entry: &Key) -> Result<Option<ResultEntry>> {
-        let path = self.get_cache_entry_path(entry).await?;
+    pub async fn get_cached_entry(&self, entry: &Key) -> Result<Option<Cached<ResultEntry>>> {
+        let Some(path) = self.get_cache_entry_path(entry).await? else {
+            return Ok(None);
+        };
 
-        if let Some(path) = path {
-            let marker_expired_result = self
-                .get_marker_and_clean_expired_if_needed(entry, &path)
-                .await?;
+        let Some((marker, freshness)) = unless_vanished(self.inspect_entry(entry, &path).await)?
+        else {
+            trace!("Haven't found marker or entry is past retention for key {entry:?}");
+            return Ok(None);
+        };
 
-            if marker_expired_result.is_none() {
-                trace!("Haven't found marker or entry is expired for key {entry:?}");
-                return Ok(None);
-            }
+        let read = self
+            .handler
+            .read_cache(entry, &self.config, &path, &marker)
+            .await;
+        let result = unless_vanished(read)?;
 
-            let marker = marker_expired_result.unwrap();
-
-            let result = self
-                .handler
-                .read_cache(entry, &self.config, &path, &marker)
-                .await?;
-
-            if result.is_some() {
-                trace!("Cache entry found.");
-            } else {
-                trace!("Cache entry missing at path {}.", path.display());
-            }
-
-            Ok(result)
+        if result.is_some() {
+            trace!("Cache entry found ({freshness:?}).");
         } else {
-            Ok(None)
+            trace!("Cache entry missing at path {}.", path.display());
         }
+
+        Ok(result.map(|value| Cached { value, freshness }))
     }
 
+    /// Reads the entry's marker and classifies its freshness, deleting it once past retention.
     #[instrument(name = "check_entry", skip(self, path))]
-    async fn get_marker_and_clean_expired_if_needed(
-        &self,
-        entry: &Key,
-        path: &Path,
-    ) -> Result<Option<Marker>> {
+    async fn inspect_entry(&self, entry: &Key, path: &Path) -> Result<Option<(Marker, Freshness)>> {
         if !path.exists() {
             trace!("Cache entry path doesn't exist.");
             return Ok(None);
         }
 
-        let marker_path = self.handler.get_marker_path(entry, &self.config).await?;
-        let marker_path = if marker_path.is_empty() {
-            path.to_owned()
-        } else {
-            path.join(marker_path)
-        };
+        let marker_path = self.marker_path(entry, path).await?;
 
         if !marker_path.exists() {
             trace!("Cache entry path {} doesn't exist.", marker_path.display());
@@ -185,24 +238,48 @@ where
             .handler
             .read_marker(entry, &self.config, &marker_path)
             .await?;
-        let marker_metadata = marker_path.metadata().explain(format!(
-            "Unable to read marker for entry {:?} ({})",
-            entry,
-            marker_path.display()
-        ))?;
+        let written_at = marker_path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .explain(format!(
+                "Unable to read marker for entry {:?} ({})",
+                entry,
+                marker_path.display()
+            ))?;
 
-        let is_expired = self
-            .handler
-            .is_expired(entry, &self.config, &marker, marker_metadata)?;
+        let age = SystemTime::now()
+            .duration_since(written_at)
+            .unwrap_or_default();
 
-        if is_expired {
-            trace!("Entry is expired, discarding.");
+        let freshness = freshness_at(
+            age,
+            self.handler.fresh_for(entry, &self.config),
+            self.handler.retain_stale_for(&self.config),
+        );
+
+        if freshness.is_none() {
+            trace!("Entry is past retention, discarding.");
             Self::invalidate_self(entry, path).await?;
-
-            return Ok(None);
         }
 
-        Ok(Some(marker))
+        Ok(freshness.map(|freshness| (marker, freshness)))
+    }
+
+    pub async fn remove_cache_entry(&self, entry: &Key) -> Result<()> {
+        match self.get_cache_entry_path(entry).await? {
+            Some(path) if path.exists() => Self::invalidate_self(entry, &path).await,
+            _ => Ok(()),
+        }
+    }
+
+    async fn marker_path(&self, entry: &Key, path: &Path) -> Result<PathBuf> {
+        let marker_path = self.handler.get_marker_path(entry, &self.config).await?;
+
+        Ok(if marker_path.is_empty() {
+            path.to_owned()
+        } else {
+            path.join(marker_path)
+        })
     }
 
     #[inline]
@@ -212,17 +289,16 @@ where
             p = path.display()
         );
 
-        if path.is_dir() {
-            fs::remove_dir_all(path)
-                .await
-                .explain(format!("Unable to invalidate cache entry {entry:?}"))?;
+        let removed = if path.is_dir() {
+            fs::remove_dir_all(path).await
         } else {
-            fs::remove_file(path)
-                .await
-                .explain(format!("Unable to invalidate cache entry {entry:?}"))?;
-        }
+            fs::remove_file(path).await
+        };
 
-        Ok(())
+        match removed {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            removed => removed.explain(format!("Unable to invalidate cache entry {entry:?}")),
+        }
     }
 
     #[instrument(name = "set_cache_entry", skip(self, value))]
@@ -234,16 +310,21 @@ where
         let path = self.get_cache_entry_path(entry).await?;
 
         if let Some(path) = &path {
-            if path.exists() && !self.handler.always_overwrite() {
-                return Ok(Some(path.clone()));
-            }
+            let marker_path = self.marker_path(entry, path).await?;
 
-            let marker_path = self.handler.get_marker_path(entry, &self.config).await?;
-            let marker_path = if marker_path.is_empty() {
-                path.to_owned()
-            } else {
-                path.join(marker_path)
-            };
+            if path.exists() {
+                if self.handler.is_content_addressed() {
+                    renew(&marker_path)
+                        .explain(format!("Unable to renew cache entry {entry:?}"))?;
+                    return Ok(Some(path.clone()));
+                }
+
+                if let Some((_, Freshness::Fresh)) = self.inspect_entry(entry, path).await? {
+                    return Ok(Some(path.clone()));
+                }
+
+                Self::invalidate_self(entry, path).await?;
+            }
 
             self.handler
                 .write_cache(entry, value, &self.config, path)
@@ -275,13 +356,71 @@ where
             let path = file.path();
 
             if let Some(key) = self.handler.read_key_from_path(&self.config, &path).await? {
-                let _ = self
-                    .get_marker_and_clean_expired_if_needed(&key, &path)
+                let inspected = self
+                    .inspect_entry(&key, &path)
                     .instrument(Span::none())
-                    .await?;
+                    .await;
+                unless_vanished(inspected)?;
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn entries_are_fresh_then_stale_then_gone() {
+        assert_eq!(
+            freshness_at(Duration::ZERO, 15 * MINUTE, 60 * MINUTE),
+            Some(Freshness::Fresh)
+        );
+        assert_eq!(
+            freshness_at(15 * MINUTE, 15 * MINUTE, 60 * MINUTE),
+            Some(Freshness::Stale)
+        );
+        assert_eq!(
+            freshness_at(74 * MINUTE, 15 * MINUTE, 60 * MINUTE),
+            Some(Freshness::Stale)
+        );
+        assert_eq!(freshness_at(75 * MINUTE, 15 * MINUTE, 60 * MINUTE), None);
+    }
+
+    #[test]
+    fn without_stale_retention_entries_expire_at_their_lifetime() {
+        assert_eq!(freshness_at(15 * MINUTE, 15 * MINUTE, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn only_entries_that_vanished_count_as_misses() {
+        let io = |kind| -> Result<Option<()>> {
+            Err(
+                RenderRequestError::ExplainedIoError(std::io::Error::from(kind), String::new())
+                    .into(),
+            )
+        };
+
+        assert!(matches!(
+            unless_vanished(io(std::io::ErrorKind::NotFound)),
+            Ok(None)
+        ));
+        assert!(unless_vanished(io(std::io::ErrorKind::PermissionDenied)).is_err());
+    }
+
+    #[test]
+    fn indefinitely_cached_entries_stay_fresh() {
+        assert_eq!(
+            freshness_at(
+                Duration::from_secs(u64::MAX / 2),
+                Duration::MAX,
+                60 * MINUTE
+            ),
+            Some(Freshness::Fresh)
+        );
     }
 }

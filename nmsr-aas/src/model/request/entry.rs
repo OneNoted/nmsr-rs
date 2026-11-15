@@ -26,6 +26,15 @@ impl RenderRequestEntry {
         Self::PlayerSkin(skin, cape)
     }
 
+    /// Default skins are cached indefinitely, so their hashes are recognised however they arrive.
+    pub(crate) fn texture_hash(hash: String) -> Self {
+        if DefaultSkinResolver::is_default_skin_hash(&hash) {
+            Self::DefaultSkinTextureHash(hash)
+        } else {
+            Self::TextureHash(hash)
+        }
+    }
+
     pub(crate) fn default_skin_hash(skin: DefaultSkin, is_slim: bool) -> RenderRequestEntry {
         // TODO: Move to CoW
         Self::DefaultSkinTextureHash(
@@ -72,7 +81,7 @@ impl TryFrom<String> for RenderRequestEntry {
                 "}));
             }
 
-            Ok(Self::TextureHash(value))
+            Ok(Self::texture_hash(value))
         } else if value.len() <= 16
             && value
                 .chars()

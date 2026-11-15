@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fs::Metadata, path::Path};
+use std::{borrow::Cow, path::Path, time::Duration};
 
 use async_trait::async_trait;
 use tokio::fs;
@@ -45,18 +45,19 @@ impl CacheHandler<str, MojangTexture, ModelCacheConfiguration, ()> for MojangTex
         Ok(String::new())
     }
 
-    fn is_expired(
-        &self,
-        entry: &str,
-        config: &ModelCacheConfiguration,
-        _marker: &(),
-        marker_metadata: Metadata,
-    ) -> Result<bool> {
-        config.is_expired_with_default(
-            &RenderRequestEntry::TextureHash(entry.to_string()),
-            &marker_metadata,
+    fn fresh_for(&self, entry: &str, config: &ModelCacheConfiguration) -> Duration {
+        *config.get_cache_duration_with_default(
+            &RenderRequestEntry::texture_hash(entry.to_string()),
             &config.texture_cache_duration,
         )
+    }
+
+    fn retain_stale_for(&self, config: &ModelCacheConfiguration) -> Duration {
+        config.stale_if_error_duration
+    }
+
+    fn is_content_addressed(&self) -> bool {
+        true
     }
 
     async fn write_cache(

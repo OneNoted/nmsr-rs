@@ -29,7 +29,7 @@ use nmsr_rendering::high_level::pipeline::{
     GraphicsContextPools,
 };
 pub use render::{render, render_get_warning, render_post_warning};
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::sync::Arc;
 use strum::IntoEnumIterator;
 use tracing::{info, info_span, instrument, Instrument, Span};
 #[cfg(feature = "renderdoc")]
@@ -84,10 +84,6 @@ impl<'a> RenderRequestValidator for NMSRState<'a> {
 }
 
 impl<'a> NMSRState<'a> {
-    const ONE_YEAR_DURATION: Duration = Duration::from_secs(
-        60 /* seconds */ * 60 /* minutes */ * 24 /* hours */ * 365, /* days */
-    );
-
     pub async fn new(config: &NmsrConfiguration) -> Result<Self> {
         let mojang_client = MojangClient::new(Arc::new(config.mojank.clone()))?;
         let cache_config = Self::setup_default_skin_cache_biases(config.caching.clone());
@@ -393,29 +389,6 @@ impl<'a> NMSRState<'a> {
         }
 
         return config;
-    }
-
-    pub fn get_cache_control_for_request(&self, request: &RenderRequest) -> Cow<'_, str> {
-        // Don't cache requests using custom mode.
-        if request.mode.is_custom() {
-            return "public, no-store".into();
-        }
-
-        // Get the cache duration for this entry.
-        let entry_duration = self.cache_config.get_cache_duration(&request.entry);
-
-        // Limit our max-age duration to 1 year if we have set this entry to be cached forever.
-        let max_age_duration = entry_duration.min(&Self::ONE_YEAR_DURATION);
-
-        let immutable = if entry_duration == &Duration::MAX {
-            ", immutable"
-        } else {
-            ""
-        };
-
-        let max_age = max_age_duration.as_secs();
-
-        format!("public, max-age={max_age}{immutable}").into()
     }
 }
 
