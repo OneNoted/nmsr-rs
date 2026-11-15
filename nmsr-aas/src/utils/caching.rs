@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio_stream::{wrappers::ReadDirStream, StreamExt};
 use tracing::{instrument, trace, trace_span, Instrument, Span};
 
-use crate::error::{ExplainableExt, Result};
+use crate::error::{ExplainableExt, NMSRaaSError, RenderRequestError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Freshness {
@@ -47,9 +47,13 @@ impl<V> Cached<V> {
 }
 
 /// An entry removed while being read (by cleanup or a concurrent refresh) is a miss, not a failure.
-fn unless_vanished<T>(path: &Path, result: Result<Option<T>>) -> Result<Option<T>> {
+fn unless_vanished<T>(result: Result<Option<T>>) -> Result<Option<T>> {
     match result {
-        Err(_) if !path.exists() => Ok(None),
+        Err(NMSRaaSError::RenderRequestError(RenderRequestError::ExplainedIoError(error, _)))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
         result => result,
     }
 }
@@ -195,8 +199,7 @@ where
             return Ok(None);
         };
 
-        let Some((marker, freshness)) =
-            unless_vanished(&path, self.inspect_entry(entry, &path).await)?
+        let Some((marker, freshness)) = unless_vanished(self.inspect_entry(entry, &path).await)?
         else {
             trace!("Haven't found marker or entry is past retention for key {entry:?}");
             return Ok(None);
@@ -206,7 +209,7 @@ where
             .handler
             .read_cache(entry, &self.config, &path, &marker)
             .await;
-        let result = unless_vanished(&path, read)?;
+        let result = unless_vanished(read)?;
 
         if result.is_some() {
             trace!("Cache entry found ({freshness:?}).");
@@ -357,7 +360,7 @@ where
                     .inspect_entry(&key, &path)
                     .instrument(Span::none())
                     .await;
-                unless_vanished(&path, inspected)?;
+                unless_vanished(inspected)?;
             }
         }
 
@@ -391,6 +394,22 @@ mod tests {
     #[test]
     fn without_stale_retention_entries_expire_at_their_lifetime() {
         assert_eq!(freshness_at(15 * MINUTE, 15 * MINUTE, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn only_entries_that_vanished_count_as_misses() {
+        let io = |kind| -> Result<Option<()>> {
+            Err(
+                RenderRequestError::ExplainedIoError(std::io::Error::from(kind), String::new())
+                    .into(),
+            )
+        };
+
+        assert!(matches!(
+            unless_vanished(io(std::io::ErrorKind::NotFound)),
+            Ok(None)
+        ));
+        assert!(unless_vanished(io(std::io::ErrorKind::PermissionDenied)).is_err());
     }
 
     #[test]

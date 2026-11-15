@@ -90,8 +90,8 @@ pub struct NmsrHttpClient {
 
 /// Wait used when an upstream answers 429 without a usable `Retry-After`.
 const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
-/// Upper bound so a hostile or buggy `Retry-After` cannot disable a host for long.
-const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_mins(5);
+/// Upper bound so a buggy `Retry-After` cannot disable a host indefinitely.
+const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_hours(1);
 
 /// Per-host deadlines before which requests are refused locally instead of sent,
 /// so a rate-limited upstream is not asked again until it said it would answer.
@@ -582,6 +582,7 @@ mod tests {
 
         assert_eq!(at("Sun, 15 Nov 2026 14:00:45 GMT"), Duration::from_secs(45));
         assert_eq!(at("Sun, 15 Nov 2026 13:59:00 GMT"), Duration::ZERO);
+        assert_eq!(at("Sun, 15 Nov 2026 14:20:00 GMT"), Duration::from_mins(20));
         assert_eq!(at("Mon, 16 Nov 2026 14:00:00 GMT"), MAX_RATE_LIMIT_BACKOFF);
     }
 
