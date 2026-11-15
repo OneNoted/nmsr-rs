@@ -330,14 +330,19 @@ impl RenderRequestResolver {
 
         let fetched = self.fetch_entry_textures(entry).await;
 
-        if let Ok(textures) = &fetched {
-            if let Err(error) = self
-                .model_cache
-                .cache_resolved_texture(entry, textures)
-                .await
-            {
-                warn!(%error, "Unable to cache resolved textures for {entry:?}");
+        let cached = match &fetched {
+            Ok(textures) => {
+                self.model_cache
+                    .cache_resolved_texture(entry, textures)
+                    .await
             }
+            Err(error) if stale.is_some() && error.failure_kind().is_definitive_absence() => {
+                self.model_cache.forget_resolved_texture(entry).await
+            }
+            Err(_) => Ok(()),
+        };
+        if let Err(error) = cached {
+            warn!(%error, "Unable to update cached textures for {entry:?}");
         }
 
         stale_if_error(fetched, stale)
@@ -360,10 +365,15 @@ impl RenderRequestResolver {
             .await
             .map_err(NMSRaaSError::from);
 
-        if let Ok(id) = &fetched {
-            if let Err(error) = self.model_cache.cache_resolved_name(name, *id).await {
-                warn!(%error, "Unable to cache resolved name {name:?}");
+        let cached = match &fetched {
+            Ok(id) => self.model_cache.cache_resolved_name(name, *id).await,
+            Err(error) if stale.is_some() && error.failure_kind().is_definitive_absence() => {
+                self.model_cache.forget_resolved_name(name).await
             }
+            Err(_) => Ok(()),
+        };
+        if let Err(error) = cached {
+            warn!(%error, "Unable to update cached name {name:?}");
         }
 
         stale_if_error(fetched, stale)

@@ -251,18 +251,27 @@ async fn player_without_a_skin_gets_their_own_default_as_a_current_render() {
 }
 
 #[tokio::test]
-async fn definitive_absence_replaces_the_last_known_good_skin() {
+async fn definitive_absence_replaces_the_last_known_good_skin_for_good() {
     let h = harness().await;
     resolve(&h, &by_name()).await;
 
     h.fake.set(Upstream::Missing);
-    assert_eq!(
-        resolve(&h, &by_name()).await,
-        (
-            TextureSource::Fallback(FallbackReason::PlayerNotFound),
-            DEFAULT_SKIN
-        )
+    let missing = (
+        TextureSource::Fallback(FallbackReason::PlayerNotFound),
+        DEFAULT_SKIN,
     );
+    assert_eq!(resolve(&h, &by_name()).await, missing);
+    assert_eq!(resolve(&h, &by_uuid()).await, missing);
+
+    h.fake.set(Upstream::RateLimited {
+        retry_after_secs: 0,
+    });
+    let unavailable = (
+        TextureSource::Fallback(FallbackReason::UpstreamUnavailable),
+        DEFAULT_SKIN,
+    );
+    assert_eq!(resolve(&h, &by_name()).await, unavailable);
+    assert_eq!(resolve(&h, &by_uuid()).await, unavailable);
 }
 
 #[tokio::test]

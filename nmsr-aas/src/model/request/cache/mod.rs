@@ -145,6 +145,14 @@ impl ModelCache {
             .map(|_| ())
     }
 
+    pub async fn forget_resolved_texture(&self, entry: &RenderRequestEntry) -> Result<()> {
+        self.resolved_textures.remove_cache_entry(entry).await
+    }
+
+    pub async fn forget_resolved_name(&self, name: &str) -> Result<()> {
+        self.resolved_names.remove_cache_entry(name).await
+    }
+
     pub async fn cache_resolved_name(&self, name: &str, uuid: Uuid) -> Result<()> {
         self.resolved_names
             .set_cache_entry(name, &uuid)

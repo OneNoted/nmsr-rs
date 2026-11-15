@@ -247,6 +247,13 @@ where
         Ok(freshness.map(|freshness| (marker, freshness)))
     }
 
+    pub async fn remove_cache_entry(&self, entry: &Key) -> Result<()> {
+        match self.get_cache_entry_path(entry).await? {
+            Some(path) if path.exists() => Self::invalidate_self(entry, &path).await,
+            _ => Ok(()),
+        }
+    }
+
     async fn marker_path(&self, entry: &Key, path: &Path) -> Result<PathBuf> {
         let marker_path = self.handler.get_marker_path(entry, &self.config).await?;
 

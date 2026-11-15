@@ -14,11 +14,8 @@ use axum::{
     http::HeaderValue,
     response::{IntoResponse, Response},
 };
-use http::HeaderName;
-use hyper::{
-    header::{CACHE_CONTROL, CONTENT_TYPE, ETAG},
-    Method,
-};
+use http::{HeaderMap, HeaderName};
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG};
 use std::{borrow::Cow, time::Duration};
 use tracing::instrument;
 use xxhash_rust::xxh3::xxh3_128;
@@ -47,17 +44,20 @@ const PLAYER_NOT_FOUND_MAX_AGE: Duration = Duration::from_mins(5);
 const LAST_KNOWN_GOOD_MAX_AGE: Duration = Duration::from_mins(1);
 
 #[axum::debug_handler]
-#[instrument(skip(state, method))]
+#[instrument(skip(state))]
 pub async fn render(
     state: State<NMSRState<'static>>,
-    method: Method,
     mut request: RenderRequest,
 ) -> Result<Response> {
     let resolved = state.resolver.resolve(&request).await?;
     let source = resolved.source;
+    let cache_control = cache_control(&state.cache_config, &request, source);
 
     if request.mode.is_blockbench_export() {
-        return internal_bbmodel_export(state, method, request).await;
+        let mut response = internal_bbmodel_export(&state, request, resolved).await?;
+        apply_source_headers(response.headers_mut(), &cache_control, source);
+
+        return Ok(response);
     }
 
     let image = match request.mode {
@@ -66,8 +66,6 @@ pub async fn render(
         }
         _ => internal_render_model(&mut request, &state, &resolved).await,
     }?;
-
-    let cache_control = cache_control(&state.cache_config, &request, source);
 
     Ok(image_response(image, &cache_control, source))
 }
@@ -79,12 +77,18 @@ fn image_response(image: Vec<u8>, cache_control: &str, source: TextureSource) ->
 
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(IMAGE_PNG_MIME));
 
-    if let Ok(cache_control) = HeaderValue::from_str(cache_control) {
-        headers.insert(CACHE_CONTROL, cache_control);
-    }
-
     if let Ok(etag) = HeaderValue::from_str(&etag) {
         headers.insert(ETAG, etag);
+    }
+
+    apply_source_headers(headers, cache_control, source);
+
+    response
+}
+
+fn apply_source_headers(headers: &mut HeaderMap, cache_control: &str, source: TextureSource) {
+    if let Ok(cache_control) = HeaderValue::from_str(cache_control) {
+        headers.insert(CACHE_CONTROL, cache_control);
     }
 
     match source {
@@ -103,8 +107,6 @@ fn image_response(image: Vec<u8>, cache_control: &str, source: TextureSource) ->
             );
         }
     }
-
-    response
 }
 
 fn cache_control(
